@@ -1,0 +1,10 @@
+[package]
+name = "scratch-new"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kvm-bindings = "0.14.0"
+kvm-ioctls = "0.24.0"
+vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
+vmm-sys-util = "0.15.0"
