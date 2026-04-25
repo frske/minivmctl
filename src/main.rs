@@ -218,7 +218,7 @@ fn write_page_tables(
     guest_mem: &GuestMemoryMmap<()>,
     boot_pdpte_addr: GuestAddress,
     boot_pde_addr: GuestAddress,
-    boot_pte_addr: GuestAddress,
+    _boot_pte_addr: GuestAddress,
     boot_pml4_addr: GuestAddress,
 ) {
     guest_mem
@@ -246,19 +246,7 @@ fn write_page_tables(
 }
 
 fn configure_vcpu(kvm: &Kvm, vcpu: &mut kvm_ioctls::VcpuFd, kernel_entry: &GuestAddress) {
-    let mut kvm_cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES).unwrap();
-    let entries = kvm_cpuid.as_mut_slice();
-
-    // for entry in entries.iter_mut() {
-    //     match entry.function {
-    //         0 => {
-    //             println!("EBX: {:x}", entry.ebx);
-    //             println!("EDX: {:x}", entry.edx);
-    //             println!("ECX: {:x}", entry.ecx);
-    //         }
-    //         _ => (),
-    //     }
-    // }
+    let kvm_cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES).unwrap();
 
     vcpu.set_cpuid2(&kvm_cpuid).unwrap();
 
