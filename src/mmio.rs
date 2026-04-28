@@ -1,0 +1,260 @@
+mod device_status {
+    pub const INIT: u32 = 0;
+    pub const ACKNOWLEDGE: u32 = 1;
+    pub const DRIVER: u32 = 2;
+    pub const FAILED: u32 = 128;
+    pub const FEATURES_OK: u32 = 8;
+    pub const DRIVER_OK: u32 = 4;
+    pub const DEVICE_NEEDS_RESET: u32 = 64;
+}
+
+pub struct MMIOTransport {
+    device: Arc<Mutex<dyn VirtioDevice>>,
+    features_select: u32,
+    acked_features_select: u32,
+    queue_select: u32,
+    device_status: u32,
+    interrupt_status: Arc<AtomicU32>,
+    config_generation: Wrapping<u32>,
+    mem: GuestMemoryMmap,
+}
+
+impl MMIOTransport {
+    pub fn new(device: Arc<Mutex<dyn VirtioDevice>>, mem: GuestMemoryMmap) -> Self {
+        let interrupt_status = device.lock().unwrap().interrupt_status();
+
+        Self {
+            device,
+            features_select: 0,
+            acked_features_select: 0,
+            queue_select: 0,
+            device_status: 0,
+            interrupt_status,
+            config_generation: Wrapping(0),
+            mem,
+        }
+    }
+}
+
+impl MMIOTransport {
+    #[inline]
+    // fn with_queue<F: FnOnce(&Queue) -> O, O>(&self, f: F) -> Option<O> {
+    // }
+    fn with_queue<F, O>(&self, f: F) -> Option<O>
+    where
+        F: FnOnce(&Queue) -> O,
+    {
+        self.device
+            .lock()
+            .unwrap()
+            .queues()
+            .get(self.queue_select as usize)
+            .map(f)
+
+        // let guard = self.device.lock().unwrap();
+        // let queue = guard.queues().get(self.queue_select as usize)?;
+        // Some(f(queue))
+    }
+
+    #[inline]
+    fn with_queue_mut<F, O>(&mut self, f: F) -> Option<O>
+    where
+        F: FnOnce(&mut Queue) -> O,
+    {
+        self.device
+            .lock()
+            .unwrap()
+            .queues_mut()
+            .get_mut(self.queue_select as usize)
+            .map(f)
+    }
+
+    #[inline]
+    const fn check_device_status(&self, set: u32, clear: u32) -> bool {
+        // self.device_status & (set | clear) == set
+        (self.device_status & set) == set && (self.device_status & clear) == 0
+    }
+
+    #[inline]
+    fn update_queue_field<F>(&mut self, f: F)
+    where
+        F: FnOnce(&mut Queue),
+    {
+        if self.check_device_status(
+            device_status::FEATURES_OK,
+            device_status::DRIVER_OK | device_status::FAILED,
+        ) {
+            self.with_queue_mut(f);
+        }
+    }
+
+    fn set_device_status(&mut self, status: u32) {
+        use device_status::*;
+
+        let missing_bits = status & !self.device_status;
+
+        match missing_bits {
+            ACKNOWLEDGE if self.device_status == INIT => self.device_status = status,
+            DRIVER if self.device_status == ACKNOWLEDGE => {
+                self.device_status = status;
+            }
+            FEATURES_OK if self.device_status == (ACKNOWLEDGE | DRIVER) => {
+                self.device_status = status;
+            }
+            DRIVER_OK if self.device_status == (ACKNOWLEDGE | DRIVER | FEATURES_OK) => {
+                self.device_status = status;
+                let mut locked_device = self.device.lock().unwrap();
+                let device_activated = locked_device.is_activated();
+
+                if !device_activated
+                    && locked_device
+                        .queues()
+                        .iter()
+                        .all(|q: Queue| q.is_valid(mem))
+                {
+                    let activate_result = locked_device.activate(self.mem.clone());
+                    if activate_result.is_err() {
+                        self.device_status |= DEVICE_NEEDS_RESET;
+
+                        let _ = locked_device.interrupt_trigger().trigger(IrqType::Config);
+                        //no clue what is supposed ot happen here, probably just trigger() with no type+
+                    }
+                }
+            }
+            _ if (status & FAILED) != 0 => {
+                // todo: notify backend driver to stop the device
+                self.device_status |= FAILED
+            }
+
+            _ if status == 0 => {
+                let mut locked_device = self.device.lock().unwrap();
+                if locked_device.is_activated() {
+                    let mut device_status = self.device_status;
+                    let reset_result = locked_device.reset();
+                    match reset_result {
+                        Some((_interrupt_evt, mut _queue_evts)) => {}
+                        None => {
+                            device_status |= FAILED;
+                        }
+                    }
+                    self.device_status = device_status;
+                }
+
+                if self.device_status & FAILED == 0 {
+                    self.features_select = 0;
+                    self.acked_features_select = 0;
+                    self.queue_select = 0;
+                    self.interrupt_status.store(0, Ordering::SeqCst);
+                    self.device_status = device_status::INIT;
+
+                    for queue in locked_device.queues_mut() {
+                        *queue = Queue::new(queue.max_size)
+                    }
+                }
+            }
+            _ => (),
+        }
+    }
+
+    pub fn bus_read(&mut self, offset: u64, data: &mut [u8]) {
+        if offset <= 0xff && data.len() == 4 {
+            let v = match offset {
+                0x0 => MMIO_MAGIC_VALUE,
+                0x04 => MMIO_VERSION,
+                0x08 => self.device.lock().unwrap().device_type(),
+                0x0c => VENDOR_ID,
+                0x10 => self.features_for_page(),
+                0x34 => self.with_queue(|q| u32::from(q.max_size)).unwrap_or(0),
+                0x44 => self.with_queue(|q| u32::from(q.ready)).unwrap_or(0),
+                0x60 => self.interrupt_status.load(Ordering::SeqCst),
+                0x70 => self.device_status,
+                0xfc => self.config_generation.0,
+                _ => {
+                    return;
+                }
+            };
+            data.copy_from_slice(v.to_le_bytes().as_slice());
+        } else if (offset >= 0x100) && (offset <= 0xfff) {
+            self.device
+                .lock()
+                .unwrap()
+                .read_config((offset - 0x100) as u32, data);
+        }
+    }
+
+    pub fn reason(offset: u64, data: &mut [u8]) {
+        if offset <= 0xff && data.len() == 4 {}
+    }
+
+    pub fn bus_write(&mut self, offset: u64, data: &[u8]) {
+        fn set_high32(v: &mut GuestAddress, x: u32) {
+            *v = (*v & 0xffff_ffff) | (u64::from(x) << 32)
+        }
+
+        fn set_low32(v: &mut GuestAddress, x: u32) {
+            *v = (*v & !0xffff_ffff) | u64::from(x)
+        }
+
+        if offset <= 0xff && data.len() == 4 {
+            let mut buf: [u8; 4] = [0; 4];
+            buf.copy_from_slice(data);
+            let v = u32::from_le_bytes(buf);
+            match offset {
+                0x14 => self.features_select.v,
+                0x20 => {
+                    if self.check_device_status(
+                        device_status::DRIVER,
+                        device_status::FEATURES_OK
+                            | device_status::FAILED
+                            | device_status::DEVICE_NEEDS_RESET,
+                    ) {
+                        self.device
+                            .lock()
+                            .unwrap()
+                            .ack_features_by_page(self.acked_features_select, v);
+                    }
+                }
+                0x24 => self.acked_features_select = v,
+                0x30 => self.queue_select = v,
+                0x38 => self.update_queue_field(|q| q.size = (v & 0xffff) as u16),
+                0x44 => self.update_queue_field(|q| q.ready = v == 1),
+                0x54 => {
+                    if self.check_device_status(device_status::DRIVER_OK, 0) {
+                        self.interrupt_status.fetch_and(!v, Ordering::SeqCst);
+                    }
+                }
+                0x70 => self.set_device_status(v),
+                0x80 => self.update_queue_field(|q| set_low32(&mut q.desc_table, v)),
+                0x84 => self.update_queue_field(|q| set_high32(&mut q.desc_table, v)),
+                0x90 => self.update_queue_field(|q| set_low32(&mut q.avail_ring, v)),
+                0x94 => self.update_queue_field(|q| set_high32(&mut q.avail_ring, v)),
+                0xa0 => self.update_queue_field(|q| set_low32(&mut q.used_ring, v)),
+                0xa4 => self.update_queue_field(|q| set_high32(&mut q.used_ring, v)),
+                _ => {}
+            }
+        } else if offset >= 0x100 && offset <= 0xfff {
+            if self.check_device_status(
+                device_status::DRIVER,
+                device_status::FAILED | device_status::DEVICE_NEEDS_RESET,
+            ) {
+                self.device
+                    .lock()
+                    .unwrap()
+                    .write_config((offset - 0x100) as u32, data);
+                self.config_generation += 1;
+            }
+        }
+    }
+
+    fn features_for_page(&mut self) -> u32 {
+        let mut features = self
+            .device
+            .lock()
+            .unwrap()
+            .avail_features_by_page(self.features_select);
+        if self.features_select == 1 {
+            features |= 0x1;
+        }
+        features
+    }
+}
