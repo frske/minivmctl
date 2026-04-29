@@ -1,3 +1,20 @@
+const MMIO_MAGIC_VALUE: u32 = 0x7472_6976;
+const MMIO_VERSION: u32 = 2;
+const VENDOR_ID: u32 = 0;
+
+use std::{
+    num::Wrapping,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
+};
+
+use crate::virtio::{Queue, VirtioDevice};
+use vm_memory::GuestAddress;
+use vm_memory::GuestMemoryMmap;
+use vm_superio::Trigger;
+
 mod device_status {
     pub const INIT: u32 = 0;
     pub const ACKNOWLEDGE: u32 = 1;
@@ -116,7 +133,7 @@ impl MMIOTransport {
                     if activate_result.is_err() {
                         self.device_status |= DEVICE_NEEDS_RESET;
 
-                        let _ = locked_device.interrupt_trigger().trigger(IrqType::Config);
+                        let _ = locked_device.interrupt_trigger().trigger(); //there was a trigger type here IrqType::Config
                         //no clue what is supposed ot happen here, probably just trigger() with no type+
                     }
                 }
@@ -182,9 +199,9 @@ impl MMIOTransport {
         }
     }
 
-    pub fn reason(offset: u64, data: &mut [u8]) {
-        if offset <= 0xff && data.len() == 4 {}
-    }
+    // pub fn reason(offset: u64, data: &mut [u8]) {
+    //     if offset <= 0xff && data.len() == 4 {}
+    // }
 
     pub fn bus_write(&mut self, offset: u64, data: &[u8]) {
         fn set_high32(v: &mut GuestAddress, x: u32) {

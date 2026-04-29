@@ -1,0 +1,324 @@
+use std::{
+    io,
+    num::Wrapping,
+    ops::Deref,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering, fence},
+    },
+};
+
+use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
+use vm_superio::Trigger;
+use vmm_sys_util::eventfd::EventFd;
+
+pub struct DescriptorChain<M> {
+    mem: M,
+    desc_table: GuestAddress,
+    queue_size: u16,
+    pub index: u16,
+
+    pub addr: u64,  //memroy address in Guest
+    pub len: u32,   //length of buffer
+    pub flags: u16, //readable, writable, has next
+    pub next: u16,  //next descriptor if index chained
+}
+
+impl<M: Deref<Target = impl GuestMemoryBackend>> DescriptorChain<M> {
+    pub fn new(mem: M, desc_table: GuestAddress, queue_size: u16, index: u16) -> Result<Self, ()> {
+        if index >= queue_size {
+            eprintln!("invalid index {index}, queue size: {queue_size}");
+            return Err(());
+        }
+        Ok(Self::new_unchecked(mem, desc_table, queue_size, index))
+    }
+
+    #[inline(always)]
+    pub fn new_unchecked(mem: M, desc_table: GuestAddress, queue_size: u16, index: u16) -> Self {
+        #[repr(C)]
+        #[derive(Default, Clone, Copy)]
+        struct Descriptor {
+            addr: u64,
+            len: u32,
+            flags: u16,
+            next: u16,
+        }
+        unsafe impl ByteValued for Descriptor {}
+
+        let addr = desc_table.unchecked_add((index as u64) * 16);
+        let desc = mem.read_obj::<Descriptor>(addr).unwrap();
+
+        Self {
+            mem,
+            desc_table,
+            queue_size,
+            index,
+            addr: desc.addr,
+            len: desc.len,
+            flags: desc.flags,
+            next: desc.next,
+        }
+    }
+
+    pub fn next(&self) -> Option<Result<Self, ()>>
+    where
+        M: Clone,
+    {
+        const VIRTQ_DESC_F_NEXT: u16 = 0x1;
+        if self.flags & VIRTQ_DESC_F_NEXT != 0 {
+            Some(Self::new(
+                self.mem.clone(),
+                self.desc_table,
+                self.queue_size,
+                self.next,
+            ))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub const fn is_write_only(&self) -> bool {
+        const VIRTQ_DESC_F_WRITE: u16 = 0x2;
+        self.flags & VIRTQ_DESC_F_WRITE != 0
+    }
+
+    #[inline]
+    pub fn write_at(self, mut offset: usize, mut data: &[u8]) -> io::Result<()>
+    where
+        M: Clone,
+    {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let mut next_desc = Some(self);
+        while let Some(desc) = next_desc {
+            let skip = offset.min(desc.len as usize);
+            offset -= skip;
+            if offset == 0 {
+                let to_copy = data.len().min(desc.len as usize - skip);
+                desc.mem
+                    .write_slice(&data[..to_copy], GuestAddress(desc.addr + skip as u64))
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::Other, "Failed to write slice in mem")
+                    })?;
+                data = &data[to_copy..];
+                if data.is_empty() {
+                    return Ok(());
+                }
+            }
+            next_desc = desc.next().transpose().map_err(|_| {
+                io::Error::new(io::ErrorKind::Other, "Failed to get next descriptor")
+            })?;
+        }
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Failed to write slice",
+        ))
+    }
+}
+
+pub struct Queue {
+    pub desc_table: GuestAddress,
+    pub avail_ring: GuestAddress,
+    pub used_ring: GuestAddress,
+
+    pub size: u16,
+    pub ready: bool,
+
+    pub next_avail: Wrapping<u16>,
+    pub next_used: Wrapping<u16>,
+    pub num_added: Wrapping<u16>,
+
+    pub max_size: u16,
+    pub notif_suppress: bool,
+}
+
+impl Queue {
+    pub const fn new(max_size: u16) -> Self {
+        Self {
+            max_size,
+            size: 0,
+            ready: false,
+            desc_table: GuestAddress(0),
+            avail_ring: GuestAddress(0),
+            used_ring: GuestAddress(0),
+            next_avail: Wrapping(0),
+            next_used: Wrapping(0),
+            notif_suppress: false,
+            num_added: Wrapping(0),
+        }
+    }
+
+    pub fn pop<M: Deref<Target = impl GuestMemoryBackend>>(
+        &mut self,
+        mem: M,
+    ) -> Result<Option<DescriptorChain<M>>, ()> {
+        macro_rules! try_pop {
+            () => {
+                if self.len(mem.deref()) != 0 {
+                    return self.pop_unchecked(mem).map(Option::Some);
+                }
+            };
+        }
+        fence(Ordering::Acquire);
+        try_pop!();
+        if self.notif_suppress {
+            let avail_event_addr = self.used_ring.unchecked_add(((self.size as u64) << 3) + 4);
+            mem.write_obj(self.next_avail.0, avail_event_addr).unwrap();
+            fence(Ordering::AcqRel);
+            try_pop!();
+        }
+        Ok(None)
+    }
+
+    pub fn push<M: GuestMemoryBackend>(&mut self, mem: &M, desc_index: u16, len: u32) {
+        #[repr(C)]
+        #[derive(Default, Clone, Copy)]
+        struct UsedElem {
+            id: u32,
+            len: u32,
+        }
+        unsafe impl ByteValued for UsedElem {}
+        let addr = self
+            .used_ring
+            .unchecked_add((((self.next_used.0 % self.size) as u64) << 3) + 4);
+        mem.write_obj(
+            UsedElem {
+                id: desc_index as u32,
+                len,
+            },
+            addr,
+        )
+        .unwrap();
+        self.num_added += 1;
+        self.next_avail += 1;
+        fence(Ordering::Release);
+        mem.write_obj(self.next_used.0, self.used_ring.unchecked_add(2))
+            .unwrap();
+    }
+
+    pub fn prepare_notify<M: GuestMemoryBackend>(&mut self, mem: &M) -> bool {
+        if !self.notif_suppress {
+            return mem.read_obj::<u16>(self.avail_ring).unwrap() == 0;
+        }
+        fence(Ordering::AcqRel);
+        let used_event_addr = self.avail_ring.unchecked_add(((self.size as u64) << 1) + 4);
+        let used_event = Wrapping(mem.read_obj::<u16>(used_event_addr).unwrap());
+        let num_added = self.num_added;
+        self.num_added = Wrapping(0);
+        self.next_used - used_event - Wrapping(1) < num_added
+    }
+
+    pub fn is_valid<M: GuestMemoryBackend>(&self, mem: &M) -> bool {
+        if !self.ready {
+            return false;
+        }
+        if self.size > self.max_size {
+            return false;
+        }
+        if self.size == 0 || self.size & (self.size - 1) != 0 || self.size > 32768 {
+            return false;
+        }
+        if self.desc_table.raw_value() & 0xf != 0 {
+            return false;
+        }
+        if self.avail_ring.raw_value() & 0x3 != 0 {
+            return false;
+        }
+        if self.used_ring.raw_value() & 0x1 != 0 {
+            return false;
+        }
+        if mem
+            .get_slice(self.desc_table, (self.size as usize) << 4)
+            .is_err()
+        {
+            return false;
+        }
+        if mem
+            .get_slice(self.avail_ring, ((self.size as usize) * 2) + 6)
+            .is_err()
+        {
+            return false;
+        }
+        if mem
+            .get_slice(self.used_ring, ((self.size as usize) * 8) + 6)
+            .is_err()
+        {
+            return false;
+        }
+        true
+    }
+
+    fn pop_unchecked<M: Deref<Target = impl GuestMemoryBackend>>(
+        &mut self,
+        mem: M,
+    ) -> Result<DescriptorChain<M>, ()> {
+        let addr = self
+            .avail_ring
+            .unchecked_add((((self.next_avail.0 % self.size) as u64) * 2) + 4);
+        let desc_index = mem.read_obj::<u16>(addr).unwrap();
+        let desc_chain = DescriptorChain::new(mem, self.desc_table, self.size, desc_index);
+        if desc_chain.is_ok() {
+            self.next_avail += 1;
+        } else {
+            eprintln!("pop failed because invalid desc index");
+        }
+        desc_chain
+    }
+
+    #[inline(always)]
+    fn avail_idx<M: GuestMemoryBackend>(&self, mem: &M) -> Wrapping<u16> {
+        Wrapping(
+            mem.read_obj::<u16>(self.avail_ring.unchecked_add(2))
+                .unwrap(),
+        )
+    }
+
+    #[inline(always)]
+    fn len<M: GuestMemoryBackend>(&self, mem: &M) -> u16 {
+        (self.avail_idx(mem) - self.next_avail).0
+    }
+}
+
+pub trait VirtioDevice: Send {
+    fn avail_features(&self) -> u64;
+    fn acked_features(&self) -> u64;
+    fn set_acked_features(&mut self, acked_features: u64);
+    fn has_features(&self, feature: u64) -> bool {
+        (self.acked_features() & feature) != 0
+    }
+    fn device_type(&self) -> u32;
+    fn queues(&self) -> &[Queue];
+    fn queues_mut(&mut self) -> &mut [Queue];
+    fn queues_events(&self) -> &[EventFd];
+    fn interrupt_trigger(&self) -> &dyn Trigger<E = std::io::Error>;
+    fn interrupt_status(&self) -> Arc<AtomicU32>;
+    fn avail_features_by_page(&self, page: u32) -> u32 {
+        match page {
+            0 => (self.avail_features() & 0xffff_ffff) as u32,
+            1 => (self.avail_features() >> 32) as u32,
+            _ => 0u32,
+        }
+    }
+    fn ack_features_by_page(&mut self, page: u32, value: u32) {
+        let mut v = match page {
+            0 => u64::from(value),
+            1 => u64::from(value) << 32,
+            _ => 0u64,
+        };
+        let avail_features = self.avail_features();
+        let unrequested_features = v & !avail_features;
+        if unrequested_features != 0 {
+            v &= !unrequested_features;
+        }
+        self.set_acked_features(self.acked_features() | v);
+    }
+    fn read_config(&self, offset: u32, data: &mut [u8]);
+    fn write_config(&mut self, offset: u32, data: &[u8]);
+    fn activate(&mut self, mem: GuestMemoryMmap) -> io::Result<()>;
+    fn is_activated(&self) -> bool;
+    fn reset(&mut self) -> Option<(EventFd, Vec<EventFd>)> {
+        None
+    }
+}
