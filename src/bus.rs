@@ -1,4 +1,5 @@
 use std::{
+    ops::Sub,
     ops::Range,
     process::Output,
     sync::{Arc, Mutex},
@@ -23,6 +24,10 @@ impl<A, D> Bus<A, D>
 where
     A: PartialOrd<A>,
 {
+    pub fn new() -> Self {
+        Self { devices: Vec::new() }
+    }
+
     pub fn insert(&mut self, range: Range<A>, device: Arc<Mutex<D>>) -> Result<(), ()> {
         if range.is_empty() {
             return Err(());
@@ -96,6 +101,7 @@ where
 
 pub type PIOBus = Bus<u16, PIODevice>;
 pub type MMIOBus = Bus<u64, MMIODevice>;
+type SerialDevice = ();
 
 #[non_exhaustive]
 pub enum PIODevice {
@@ -124,5 +130,29 @@ impl MMIOBus {
         const MMIO_SIZE: u64 = 0x1000;
         let device = MMIODevice::MMIOTransport(MMIOTransport::new(device, mem));
         self.insert(address..address + MMIO_SIZE, Arc::new(Mutex::new(device)))
+    }
+}
+
+impl DeviceIO for PIODevice {
+    type Offset = u16;
+
+    fn read(&mut self, _offset: Self::Offset, _data: &mut [u8]) {}
+
+    fn write(&mut self, _offset: Self::Offset, _data: &[u8]) {}
+}
+
+impl DeviceIO for MMIODevice {
+    type Offset = u64;
+
+    fn read(&mut self, offset: Self::Offset, data: &mut [u8]) {
+        match self {
+            MMIODevice::MMIOTransport(mmio) => mmio.bus_read(offset, data),
+        }
+    }
+
+    fn write(&mut self, offset: Self::Offset, data: &[u8]) {
+        match self {
+            MMIODevice::MMIOTransport(mmio) => mmio.bus_write(offset, data),
+        }
     }
 }
