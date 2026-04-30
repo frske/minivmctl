@@ -13,7 +13,6 @@ use std::{
 use crate::virtio::{Queue, VirtioDevice};
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemoryMmap;
-use vm_superio::Trigger;
 
 mod device_status {
     pub const INIT: u32 = 0;
@@ -127,7 +126,7 @@ impl MMIOTransport {
                     && locked_device
                         .queues()
                         .iter()
-                        .all(|q: Queue| q.is_valid(mem))
+                        .all(|q: &Queue| q.is_valid(&self.mem))
                 {
                     let activate_result = locked_device.activate(self.mem.clone());
                     if activate_result.is_err() {
@@ -217,7 +216,7 @@ impl MMIOTransport {
             buf.copy_from_slice(data);
             let v = u32::from_le_bytes(buf);
             match offset {
-                0x14 => self.features_select.v,
+                0x14 => self.features_select = v,
                 0x20 => {
                     if self.check_device_status(
                         device_status::DRIVER,
@@ -270,7 +269,7 @@ impl MMIOTransport {
             .unwrap()
             .avail_features_by_page(self.features_select);
         if self.features_select == 1 {
-            features |= 0x1;
+            features |= 1; // VIRTIO_F_VERSION_1
         }
         features
     }
