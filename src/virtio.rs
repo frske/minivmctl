@@ -12,8 +12,9 @@ use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, Gu
 use vm_superio::Trigger;
 use vmm_sys_util::eventfd::EventFd;
 
+#[derive(Clone)]
 pub struct DescriptorChain<M> {
-    mem: M,
+    pub(crate) mem: M,
     desc_table: GuestAddress,
     queue_size: u16,
     pub index: u16,
@@ -24,7 +25,11 @@ pub struct DescriptorChain<M> {
     pub next: u16,  //next descriptor if index chained
 }
 
-impl<M: Deref<Target = impl GuestMemoryBackend>> DescriptorChain<M> {
+impl<M> DescriptorChain<M>
+where
+    M: Deref,
+    M::Target: GuestMemoryBackend,
+{
     pub fn new(mem: M, desc_table: GuestAddress, queue_size: u16, index: u16) -> Result<Self, ()> {
         if index >= queue_size {
             eprintln!("invalid index {index}, queue size: {queue_size}");
@@ -60,18 +65,13 @@ impl<M: Deref<Target = impl GuestMemoryBackend>> DescriptorChain<M> {
         }
     }
 
-    pub fn next(&self) -> Option<Result<Self, ()>>
+    pub fn next(&self) -> Option<Self>
     where
         M: Clone,
     {
         const VIRTQ_DESC_F_NEXT: u16 = 0x1;
         if self.flags & VIRTQ_DESC_F_NEXT != 0 {
-            Some(Self::new(
-                self.mem.clone(),
-                self.desc_table,
-                self.queue_size,
-                self.next,
-            ))
+            Self::new(self.mem.clone(), self.desc_table, self.queue_size, self.next).ok()
         } else {
             None
         }
@@ -107,9 +107,7 @@ impl<M: Deref<Target = impl GuestMemoryBackend>> DescriptorChain<M> {
                     return Ok(());
                 }
             }
-            next_desc = desc.next().transpose().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "Failed to get next descriptor")
-            })?;
+            next_desc = desc.next();
         }
         Err(io::Error::new(
             io::ErrorKind::Other,
