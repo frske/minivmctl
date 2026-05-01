@@ -234,7 +234,7 @@ impl MMIOTransport {
                 0x30 => self.queue_select = v,
                 0x38 => self.update_queue_field(|q| q.size = (v & 0xffff) as u16),
                 0x44 => self.update_queue_field(|q| q.ready = v == 1),
-                0x54 => {
+                0x64 => {
                     if self.check_device_status(device_status::DRIVER_OK, 0) {
                         self.interrupt_status.fetch_and(!v, Ordering::SeqCst);
                     }
