@@ -190,10 +190,14 @@ impl Queue {
         )
         .unwrap();
         self.num_added += 1;
-        self.next_avail += 1;
+        self.next_used += 1;
         fence(Ordering::Release);
         mem.write_obj(self.next_used.0, self.used_ring.unchecked_add(2))
             .unwrap();
+    }
+
+    pub fn undo_pop(&mut self) {
+        self.next_avail -= Wrapping(1);
     }
 
     pub fn prepare_notify<M: GuestMemoryBackend>(&mut self, mem: &M) -> bool {
