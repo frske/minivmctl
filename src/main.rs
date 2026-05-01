@@ -1,7 +1,9 @@
 use std::{
+    collections::VecDeque,
     fs::File,
     io::Cursor,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 mod event;
@@ -34,6 +36,8 @@ use crate::{
     serial::DummySerialEvent,
     virtio::VirtioDevice,
 };
+
+type HostSerial = Serial<EventWrapper, DummySerialEvent, std::io::Stdout>;
 
 const MEMORY_SIZE: usize = 128 << 20;
 const BOOT_GDT_OFFSET: u64 = 0x500;
@@ -71,6 +75,7 @@ const QUEUE_NOTIFY_OFFSET: u64 = 0x50;
 const GUEST_MAC: [u8; 6] = [0x02, 0x12, 0x34, 0x56, 0x78, 0x9a];
 
 const NET_NUM_QUEUES: usize = 2;
+const TAP_RX_TOKEN: u8 = 3 + NET_NUM_QUEUES as u8;
 
 fn main() {
     // VM and guest memory setup.
@@ -158,10 +163,17 @@ fn main() {
         poll.add(evt, 3 + q_sel as u8).unwrap();
     }
 
-    let mut virtio_rx_started = false;
+    let mut tap_rx_registered = false;
+    let mut pending_stdin = VecDeque::new();
 
     'l: loop {
-        let events: PollEvents<u8> = poll.wait().unwrap();
+        flush_pending_stdin(&stdio_serial, &mut pending_stdin);
+
+        let events: PollEvents<u8> = if pending_stdin.is_empty() {
+            poll.wait().unwrap()
+        } else {
+            poll.wait_timeout(Duration::from_millis(10)).unwrap()
+        };
         for event in events.iter_readable() {
             match event.token() {
                 0 => {
@@ -173,11 +185,8 @@ fn main() {
                     match stdin.read_raw(&mut out[..]) {
                         Ok(0) => {}
                         Ok(count) => {
-                            stdio_serial
-                                .lock()
-                                .unwrap()
-                                .enqueue_raw_bytes(&out[..count])
-                                .expect("failed to enqueue bytes");
+                            pending_stdin.extend(&out[..count]);
+                            flush_pending_stdin(&stdio_serial, &mut pending_stdin);
                         }
                         Err(e) => {
                             println!("error while reading stdin: {:?}", e);
@@ -186,24 +195,24 @@ fn main() {
                 }
                 2 => {
                     let _ = virtio_net_activate_evt.read().unwrap();
-                    if !virtio_rx_started {
-                        let virtio_net = virtio_net.clone();
-                        std::thread::spawn(move || loop {
-                            {
-                                let mut net = virtio_net.lock().unwrap();
-                                let _ = net.process_rx();
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        });
-                        virtio_rx_started = true;
+                    if !tap_rx_registered {
+                        virtio_net
+                            .lock()
+                            .unwrap()
+                            .register_tap_readable(&poll, TAP_RX_TOKEN)
+                            .unwrap();
+                        tap_rx_registered = true;
                     }
+                }
+                TAP_RX_TOKEN => {
+                    let mut net = virtio_net.lock().unwrap();
+                    let _ = net.process_rx();
                 }
                 token if token >= 3 && token < 3 + NET_NUM_QUEUES as u8 => {
                     let idx = (token - 3) as usize;
                     let _ = virtio_net_queue_events[idx].read().unwrap();
                     let mut net = virtio_net.lock().unwrap();
                     let _ = net.process_tx();
-                    let _ = net.process_rx();
                 }
                 _ => unreachable!(),
             }
@@ -213,7 +222,7 @@ fn main() {
 
 fn spawn_vcpu_runtime(
     mut vcpu: kvm_ioctls::VcpuFd,
-    stdio_serial: Arc<Mutex<Serial<EventWrapper, DummySerialEvent, std::io::Stdout>>>,
+    stdio_serial: Arc<Mutex<HostSerial>>,
     mut mmio_bus: MMIOBus,
     vcpu_exit_evt: EventWrapper,
 ) {
@@ -223,15 +232,12 @@ fn spawn_vcpu_runtime(
                 Ok(run) => match run {
                     VcpuExit::IoIn(addr, data) => {
                         if addr >= COM1 && addr - COM1 < 8 {
-                            data[0] = stdio_serial.lock().unwrap().read((addr - COM1) as u8)
+                            data[0] = lock_host_serial(&stdio_serial).read((addr - COM1) as u8)
                         }
                     }
                     VcpuExit::IoOut(addr, data) => {
                         if addr >= COM1 && addr - COM1 < 8 {
-                            let _ = stdio_serial
-                                .lock()
-                                .unwrap()
-                                .write((addr - COM1) as u8, data[0]);
+                            let _ = lock_host_serial(&stdio_serial).write((addr - COM1) as u8, data[0]);
                         }
                     }
                     VcpuExit::MmioRead(addr, data) => {
@@ -260,6 +266,42 @@ fn spawn_vcpu_runtime(
         }
         vcpu_exit_evt.trigger().unwrap();
     });
+}
+
+fn lock_host_serial(
+    serial: &Arc<Mutex<HostSerial>>,
+) -> std::sync::MutexGuard<'_, HostSerial> {
+    match serial.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn flush_pending_stdin(serial: &Arc<Mutex<HostSerial>>, pending: &mut VecDeque<u8>) {
+    loop {
+        if pending.is_empty() {
+            break;
+        }
+
+        let written = {
+            let contiguous = pending.make_contiguous();
+            let mut serial = lock_host_serial(serial);
+            match serial.enqueue_raw_bytes(contiguous) {
+                Ok(written) => written,
+                Err(vm_superio::serial::Error::FullFifo) => break,
+                Err(e) => {
+                    println!("failed to enqueue bytes: {:?}", e);
+                    break;
+                }
+            }
+        };
+
+        if written == 0 {
+            break;
+        }
+
+        pending.drain(..written);
+    }
 }
 
 fn register_guest_memory(
