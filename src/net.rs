@@ -12,6 +12,7 @@ use libc::{ifreq, IFNAMSIZ, TUN_F_CSUM};
 use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 use vm_superio::Trigger;
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
+use vmm_sys_util::poll::PollContext;
 
 const TUN_F_TSO4: libc::c_uint = 0x02;
 const TUN_F_TSO6: libc::c_uint = 0x04;
@@ -120,8 +121,6 @@ impl DeviceState {
 pub struct Tap {
     file: File,
     buffer: Vec<libc::iovec>,
-    readable: bool,
-    writable: bool,
 }
 
 impl AsRawFd for Tap {
@@ -174,13 +173,7 @@ impl Tap {
         Ok(Self {
             file,
             buffer: Vec::new(),
-            readable: false,
-            writable: false,
         })
-    }
-
-    fn readable(&self) -> bool {
-        self.readable
     }
 
     pub fn set_vnet_hdr_size(&self, size: libc::c_int) -> io::Result<()> {
@@ -380,6 +373,11 @@ impl Net {
         &self.irq_trigger.irq_evt
     }
 
+    pub fn register_tap_readable(&self, poll: &PollContext<u8>, token: u8) -> io::Result<()> {
+        poll.add(&self.tap, token)
+            .map_err(|e| io::Error::from_raw_os_error(e.errno()))
+    }
+
     pub fn process_tx(&mut self) -> io::Result<()> {
         let mem = self.state.unwrap();
         let queue = &mut self.queues[TX_INDEX];
@@ -390,8 +388,8 @@ impl Net {
             let desc = match queue.pop(&mem) {
                 Ok(Some(x)) => x,
                 Ok(None) => break,
-                Err(_) => {
-                    println!("QUEUE POP FAILED ON PROCESS TX");
+                Err(e) => {
+                    println!("queue pop failed in process_tx: {:?}", e);
                     continue;
                 }
             };
@@ -404,7 +402,7 @@ impl Net {
                 }
                 Err(_e) => {
                     queue.push(&mem, desc_index, 0);
-                    println!("error");
+                    println!("tap writev failed");
                     try_notify = true;
                 }
             };
@@ -417,11 +415,6 @@ impl Net {
     }
 
     pub fn process_rx(&mut self) -> io::Result<()> {
-        if !self.tap.readable() {
-            println!("error processing rx");
-            return Ok(());
-        }
-
         let mem = self.state.unwrap();
         let queue = &mut self.queues[RX_INDEX];
 
@@ -431,8 +424,8 @@ impl Net {
             let desc = match queue.pop(&mem) {
                 Ok(Some(x)) => x,
                 Ok(None) => break,
-                Err(_) => {
-                    println!("queue pop failed in process_rx");
+                Err(e) => {
+                    println!("queue pop failed in process_rx: {:?}", e);
                     continue;
                 }
             };
@@ -441,19 +434,17 @@ impl Net {
                 Ok(n) => {
                     if let Err(_e) = desc.write_at(VNET_HDR_NUM_BUFFERS_OFFSET, &u16::to_le_bytes(1))
                     {
-                        println!("hallo halo warsaw calling");
+                        println!("failed to write vnet header num buffers");
                     }
                     queue.push(&mem, desc_index, n as u32);
                     try_notify = true;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    println!("tap (I did not), not readable");
-                    self.tap.readable = false;
                     queue.undo_pop();
                     break;
                 }
-                Err(_e) => {
-                    println!("ERROREORRROROROROROROROROR I SEE YOU");
+                Err(e) => {
+                    println!("tap readv failed: {:?}", e);
                     queue.push(&mem, desc_index, 0);
                     try_notify = true;
                 }
