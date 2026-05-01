@@ -1,11 +1,14 @@
-use std::{cell::RefCell, io, mem::zeroed, ops::Deref, os::fd::AsRawFd};
+use std::{io, mem::zeroed, ops::Deref, os::fd::AsRawFd, rc::Rc};
 
-use libc::epoll_event;
 use slab::Slab;
 use vm_superio::Trigger;
-use vmm_sys_util::{epoll::{ControlOperation, Epoll, EpollEvent, EventSet}, event::EventConsumer, eventfd::{EFD_NONBLOCK, EventFd}};
+use vmm_sys_util::{
+    epoll::{ControlOperation, Epoll, EpollEvent, EventSet},
+    eventfd::{EFD_NONBLOCK, EventFd},
+};
 
 pub struct EventWrapper(pub EventFd);
+const DEFAULT_EPOLL_EVENT_CAP: usize = 256;
 
 impl EventWrapper {
     pub fn new() -> Self {
@@ -33,30 +36,35 @@ impl Trigger for EventWrapper {
     }
 }
 
-pub struct EventLoop<T>
-where
-    T: Arc<dyn EventHandler>,
-{
-    epoll: Epoll,
+pub struct EventLoop<T> {
+    epoll: Rc<Epoll>,
     events: Vec<EpollEvent>,
-    callbacks: Slab<T>
+    callbacks: Slab<T>,
 }
 
 impl<T> EventLoop<T> {
-    pub fn new -> io::Result<Self> {
+    pub fn new() -> io::Result<Self> {
         Self::with_capacity(DEFAULT_EPOLL_EVENT_CAP)
     }
 
     pub fn with_capacity(size: usize) -> io::Result<Self> {
-        let epoll = Epoll::new()?;
-        Ok(Self { epoll, events: RefCell::new(vec![unsafe {zeroed()}; size]), callbacks: Slab::new() })
+        let epoll = Rc::new(Epoll::new()?);
+        Ok(Self {
+            epoll,
+            events: vec![unsafe { zeroed() }; size],
+            callbacks: Slab::new(),
+        })
     }
 
     pub fn register(&mut self, fd: &impl AsRawFd, event: EventSet, callback: T) -> io::Result<()> {
         let fd = fd.as_raw_fd();
         let user_data = self.callbacks.insert(callback);
         self.epoll
-            .ctl(ControlOperation::Add, fd, EpollEvent::new(events, user_data as u64))
+            .ctl(
+                ControlOperation::Add,
+                fd,
+                EpollEvent::new(event, user_data as u64),
+            )
             .map_err(|e| {
                 let _ = self.callbacks.remove(user_data);
                 e
@@ -70,41 +78,35 @@ pub trait EventHanderMut {
 }
 
 pub trait EventHandler {
-    fn handle_event(&self, events: EventSet)
+    fn handle_event(&self, events: EventSet);
 }
 
 impl<T> EventLoop<T>
-where T: EventHanderMut
+where
+    T: EventHanderMut,
 {
     pub fn tick(&mut self, timeout: i32) -> io::Result<usize> {
-        let n = self.epoll.wait(timeout, &mut  self.events[..])?;
+        let n = self.epoll.wait(timeout, &mut self.events[..])?;
         for event in self.events.iter().take(n) {
             self.callbacks[event.data() as usize].handle_event_mut(event.event_set());
         }
         Ok(n)
     }
-
-}
-
-pub struct EventLoop<T>
-where
-    T: Arc<dyn EventHandler>
-{
-    epoll: Rc<Epoll>,
-    events: Vec<EpollEvent>,
-    callbacks: Slab<T>,
 }
 
 #[derive(Debug)]
 pub struct PreRegister {
     epoll: Rc<Epoll>,
-    user_data: usize
+    user_data: usize,
 }
 
 impl<T> EventLoop<T> {
     pub fn pre_register(&mut self, callback: T) -> PreRegister {
         let user_data = self.callbacks.insert(callback);
-        PreRegister { epoll: self.epoll.clone(), user_data }
+        PreRegister {
+            epoll: self.epoll.clone(),
+            user_data,
+        }
     }
 }
 

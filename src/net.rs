@@ -7,7 +7,7 @@ use std::{
     sync::{atomic::AtomicU32, Arc},
 };
 
-use crate::virtio::{self, DescriptorChain, Queue, VirtioDevice};
+use crate::virtio::{DescriptorChain, Queue, VirtioDevice};
 use libc::{ifreq, IFNAMSIZ, TUN_F_CSUM};
 use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 use vm_superio::Trigger;
@@ -40,6 +40,7 @@ const VIRTIO_NET_F_HOST_UFO: u64 = 14;
 const VIRTIO_NET_F_GUEST_USO4: u64 = 54;
 const VIRTIO_NET_F_GUEST_USO6: u64 = 55;
 const VIRTIO_NET_F_HOST_USO: u64 = 56;
+const VIRTIO_NET_F_MAC: u64 = 5;
 
 #[derive(Clone, Copy)]
 enum IrqType {
@@ -243,7 +244,7 @@ where
         buffer: &mut Vec<libc::iovec>,
         write_only: bool,
     ) -> io::Result<&[libc::iovec]> {
-        let mut chain = self;
+        let chain = self;
         while let Some(desc) = chain.next() {
             if (write_only && desc.is_write_only()) || (!write_only && !desc.is_write_only()) {
                 buffer.push(libc::iovec {
@@ -352,6 +353,33 @@ impl VirtioDevice for Net {
 }
 
 impl Net {
+    pub fn new(name: &str, mac: Option<[u8; 6]>) -> io::Result<Self> {
+        let tap = Tap::new(name)?;
+        tap.set_vnet_hdr_size(12)?;
+
+        let mut avail_features = tap.probe().virtio_features();
+        if mac.is_some() {
+            avail_features |= 1 << VIRTIO_NET_F_MAC;
+        }
+
+        Ok(Self {
+            tap,
+            avail_features,
+            acked_features: 0,
+            queues: [Queue::new(256), Queue::new(256)],
+            queue_events: [EventFd::new(EFD_NONBLOCK)?, EventFd::new(EFD_NONBLOCK)?],
+            irq_trigger: IrqTrigger::new()?,
+            interrupt_status: Arc::new(AtomicU32::new(0)),
+            config_space: ConfigSpace(mac.map_or_else(Vec::new, |mac| mac.to_vec())),
+            state: DeviceState::Inactive,
+            activate_event: EventFd::new(EFD_NONBLOCK)?,
+        })
+    }
+
+    pub fn interrupt_event(&self) -> &EventFd {
+        &self.irq_trigger.irq_evt
+    }
+
     pub fn process_tx(&mut self) -> io::Result<()> {
         let mem = self.state.unwrap();
         let queue = &mut self.queues[TX_INDEX];
@@ -369,12 +397,12 @@ impl Net {
             };
 
             let desc_index = desc.index;
-            match self.tap.writev(&desc) {
+            match self.tap.writev(desc) {
                 Ok(_n) => {
                     queue.push(&mem, desc_index, 0);
                     try_notify = true;
                 }
-                Err(e) => {
+                Err(_e) => {
                     queue.push(&mem, desc_index, 0);
                     println!("error");
                     try_notify = true;
@@ -409,9 +437,9 @@ impl Net {
                 }
             };
             let desc_index = desc.index;
-            match self.tap.readv(&desc) {
+            match self.tap.readv(desc.clone()) {
                 Ok(n) => {
-                    if let Err(e) = desc.write_at(VNET_HDR_NUM_BUFFERS_OFFSET, &u16::to_le_bytes(1))
+                    if let Err(_e) = desc.write_at(VNET_HDR_NUM_BUFFERS_OFFSET, &u16::to_le_bytes(1))
                     {
                         println!("hallo halo warsaw calling");
                     }
@@ -424,7 +452,7 @@ impl Net {
                     queue.undo_pop();
                     break;
                 }
-                Err(e) => {
+                Err(_e) => {
                     println!("ERROREORRROROROROROROROROR I SEE YOU");
                     queue.push(&mem, desc_index, 0);
                     try_notify = true;

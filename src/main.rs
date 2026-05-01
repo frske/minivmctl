@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{self, Cursor},
+    io::Cursor,
     sync::{Arc, Mutex},
 };
 
@@ -15,7 +15,7 @@ use kvm_bindings::{
     KVM_MAX_CPUID_ENTRIES, KVM_MEM_LOG_DIRTY_PAGES, KVM_PIT_SPEAKER_DUMMY, kvm_pit_config,
     kvm_segment, kvm_userspace_memory_region,
 };
-use kvm_ioctls::{Kvm, VcpuExit};
+use kvm_ioctls::{IoEventAddress, Kvm, VcpuExit};
 use linux_loader::{
     bootparam::boot_params,
     configurator::{BootConfigurator, BootParams, linux::LinuxBootConfigurator},
@@ -24,15 +24,15 @@ use linux_loader::{
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 use vm_superio::{Serial, Trigger};
 use vmm_sys_util::{
-    fallocate,
     poll::{PollContext, PollEvents},
     terminal::Terminal,
 };
 
 use crate::{
+    bus::MMIOBus,
     event::EventWrapper,
     serial::DummySerialEvent,
-    virtio::{DescriptorChain, Queue, VirtioDevice},
+    virtio::VirtioDevice,
 };
 
 const MEMORY_SIZE: usize = 128 << 20;
@@ -58,7 +58,8 @@ const MMIO_MEM_START: u64 = FIRST_ADDR_PAST_32BITS - MEM_32BIT_GAP_SIZE;
 
 const COM1: u16 = 0x3f8;
 
-const BOOT_CMD: &str = "console=ttyS0 noapic noacpi reboot=k panic=1 pci=off nomodule";
+const BOOT_CMD: &str =
+    "console=ttyS0 noapic noacpi reboot=k panic=1 pci=off net.ifnames=0 biosdevname=0 virtio_mmio.device=4K@0xd0000000:5";
 const KERNEL_PATH: &str = "/tmp/chinsav/vmlinux";
 const INITRD_PATH: &str = "/tmp/chinsav/initrd.img";
 
@@ -66,6 +67,8 @@ const HIMEM_START: u64 = 0x100000;
 const BOOT_CMD_START: u64 = 0x20000;
 const ZERO_PAGE_START: u64 = 0x7000;
 const BOOT_STACK_POINTER: u64 = 0x8ff0;
+const QUEUE_NOTIFY_OFFSET: u64 = 0x50;
+const GUEST_MAC: [u8; 6] = [0x02, 0x12, 0x34, 0x56, 0x78, 0x9a];
 
 const NET_NUM_QUEUES: usize = 2;
 
@@ -110,6 +113,26 @@ fn main() {
     write_boot_params(&guest_mem, initrd_addr, initrd_size);
 
     // Runtime plumbing.
+    let mut mmio_bus = MMIOBus::new();
+
+    let virtio_net = net::Net::new("tap0", Some(GUEST_MAC)).expect("failed to create virtio net");
+    vm.register_irqfd(virtio_net.interrupt_event(), 5).unwrap();
+    for (q_sel, evt) in virtio_net.queues_events().iter().enumerate() {
+        let addr = IoEventAddress::Mmio(QUEUE_NOTIFY_OFFSET + MMIO_MEM_START);
+        vm.register_ioevent(evt, &addr, q_sel as u32).unwrap();
+    }
+
+    let virtio_net_activate_evt = virtio_net.activate_event.try_clone().unwrap();
+    let virtio_net_queue_events = virtio_net
+        .queues_events()
+        .iter()
+        .map(|evt| evt.try_clone().unwrap())
+        .collect::<Vec<_>>();
+    let virtio_net = Arc::new(Mutex::new(virtio_net));
+    mmio_bus
+        .insert_virtio(MMIO_MEM_START, virtio_net.clone(), guest_mem.clone())
+        .unwrap();
+
     let com_evt_1 = EventWrapper::new();
     vm.register_irqfd(&com_evt_1.0, 4).unwrap();
 
@@ -122,7 +145,7 @@ fn main() {
     let _ = kernel_entry;
 
     let exit_evt = EventWrapper::new();
-    spawn_vcpu_runtime(vcpu, stdio_serial.clone(), exit_evt.try_clone().unwrap());
+    spawn_vcpu_runtime(vcpu, stdio_serial.clone(), mmio_bus, exit_evt.try_clone().unwrap());
 
     let stdin = std::io::stdin().lock();
     stdin.set_raw_mode().expect("failed to set raw mode");
@@ -130,6 +153,12 @@ fn main() {
     let poll: PollContext<u8> = PollContext::new().unwrap();
     poll.add(&exit_evt.0, 0).unwrap();
     poll.add(&stdin, 1).unwrap();
+    poll.add(&virtio_net_activate_evt, 2).unwrap();
+    for (q_sel, evt) in virtio_net_queue_events.iter().enumerate() {
+        poll.add(evt, 3 + q_sel as u8).unwrap();
+    }
+
+    let mut virtio_rx_started = false;
 
     'l: loop {
         let events: PollEvents<u8> = poll.wait().unwrap();
@@ -155,6 +184,27 @@ fn main() {
                         }
                     }
                 }
+                2 => {
+                    let _ = virtio_net_activate_evt.read().unwrap();
+                    if !virtio_rx_started {
+                        let virtio_net = virtio_net.clone();
+                        std::thread::spawn(move || loop {
+                            {
+                                let mut net = virtio_net.lock().unwrap();
+                                let _ = net.process_rx();
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        });
+                        virtio_rx_started = true;
+                    }
+                }
+                token if token >= 3 && token < 3 + NET_NUM_QUEUES as u8 => {
+                    let idx = (token - 3) as usize;
+                    let _ = virtio_net_queue_events[idx].read().unwrap();
+                    let mut net = virtio_net.lock().unwrap();
+                    let _ = net.process_tx();
+                    let _ = net.process_rx();
+                }
                 _ => unreachable!(),
             }
         }
@@ -164,6 +214,7 @@ fn main() {
 fn spawn_vcpu_runtime(
     mut vcpu: kvm_ioctls::VcpuFd,
     stdio_serial: Arc<Mutex<Serial<EventWrapper, DummySerialEvent, std::io::Stdout>>>,
+    mut mmio_bus: MMIOBus,
     vcpu_exit_evt: EventWrapper,
 ) {
     std::thread::spawn(move || {
@@ -183,8 +234,12 @@ fn spawn_vcpu_runtime(
                                 .write((addr - COM1) as u8, data[0]);
                         }
                     }
-                    VcpuExit::MmioRead(_, _) => {}
-                    VcpuExit::MmioWrite(_, _) => {}
+                    VcpuExit::MmioRead(addr, data) => {
+                        mmio_bus.read(addr, data);
+                    }
+                    VcpuExit::MmioWrite(addr, data) => {
+                        mmio_bus.write(addr, data);
+                    }
                     VcpuExit::Hlt => {
                         println!("KVM_EXIT_HLT");
                         break;
