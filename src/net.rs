@@ -4,7 +4,10 @@ use std::{
     mem::{transmute, zeroed},
     ops::Deref,
     os::fd::{AsRawFd, FromRawFd},
-    sync::{atomic::AtomicU32, Arc},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
 };
 
 use crate::virtio::{DescriptorChain, Queue, VirtioDevice};
@@ -22,9 +25,9 @@ const TUN_F_USO4: libc::c_uint = 0x20;
 const TUN_F_USO6: libc::c_uint = 0x40;
 
 const NET_NUM_QUEUES: usize = 2;
-const TX_INDEX: usize = 0;
-const RX_INDEX: usize = 1;
-const VNET_HDR_NUM_BUFFERS_OFFSET: usize = 0;
+const RX_INDEX: usize = 0;
+const TX_INDEX: usize = 1;
+const VNET_HDR_NUM_BUFFERS_OFFSET: usize = 10;
 const VIRTIO_TYPE_NET: u32 = 1;
 const VIRTIO_RING_F_EVENT_IDX: u64 = 29;
 
@@ -51,24 +54,32 @@ enum IrqType {
 
 struct IrqTrigger {
     irq_evt: EventFd,
+    irq_status: Arc<AtomicU32>,
 }
 
 impl Clone for IrqTrigger {
     fn clone(&self) -> Self {
         Self {
             irq_evt: self.irq_evt.try_clone().unwrap(),
+            irq_status: Arc::clone(&self.irq_status),
         }
     }
 }
 
 impl IrqTrigger {
-    fn new() -> io::Result<Self> {
+    fn new(irq_status: Arc<AtomicU32>) -> io::Result<Self> {
         Ok(Self {
             irq_evt: EventFd::new(EFD_NONBLOCK)?,
+            irq_status,
         })
     }
 
-    fn trigger(&self, _irq_type: IrqType) -> io::Result<()> {
+    fn trigger(&self, irq_type: IrqType) -> io::Result<()> {
+        let bit = match irq_type {
+            IrqType::Config => 0x2,
+            IrqType::Vring => 0x1,
+        };
+        self.irq_status.fetch_or(bit, Ordering::SeqCst);
         self.irq_evt.write(1)
     }
 }
@@ -77,7 +88,7 @@ impl Trigger for IrqTrigger {
     type E = io::Error;
 
     fn trigger(&self) -> Result<(), Self::E> {
-        self.irq_evt.write(1)
+        self.trigger(IrqType::Config)
     }
 }
 
@@ -213,12 +224,6 @@ impl Tap {
     }
 }
 
-trait QueueUndoPop {
-    fn undo_pop(&mut self) {}
-}
-
-impl QueueUndoPop for Queue {}
-
 pub trait IntoIoVec {
     fn into_iovec(
         self,
@@ -237,8 +242,10 @@ where
         buffer: &mut Vec<libc::iovec>,
         write_only: bool,
     ) -> io::Result<&[libc::iovec]> {
-        let chain = self;
-        while let Some(desc) = chain.next() {
+        buffer.clear();
+        let mut next_desc = Some(self);
+
+        while let Some(desc) = next_desc {
             if (write_only && desc.is_write_only()) || (!write_only && !desc.is_write_only()) {
                 buffer.push(libc::iovec {
                     iov_base: desc
@@ -257,6 +264,7 @@ where
                     "Descriptor write_only bit not matches",
                 ));
             }
+            next_desc = desc.next();
         }
         Ok(buffer.as_slice())
     }
@@ -355,14 +363,16 @@ impl Net {
             avail_features |= 1 << VIRTIO_NET_F_MAC;
         }
 
+        let interrupt_status = Arc::new(AtomicU32::new(0));
+
         Ok(Self {
             tap,
             avail_features,
             acked_features: 0,
             queues: [Queue::new(256), Queue::new(256)],
             queue_events: [EventFd::new(EFD_NONBLOCK)?, EventFd::new(EFD_NONBLOCK)?],
-            irq_trigger: IrqTrigger::new()?,
-            interrupt_status: Arc::new(AtomicU32::new(0)),
+            irq_trigger: IrqTrigger::new(Arc::clone(&interrupt_status))?,
+            interrupt_status,
             config_space: ConfigSpace(mac.map_or_else(Vec::new, |mac| mac.to_vec())),
             state: DeviceState::Inactive,
             activate_event: EventFd::new(EFD_NONBLOCK)?,
