@@ -1,4 +1,4 @@
-use std::{io, mem::zeroed, ops::Deref, os::fd::AsRawFd, rc::Rc};
+use std::{cell::RefCell, io, mem::zeroed, ops::Deref, os::fd::AsRawFd, rc::Rc};
 
 use slab::Slab;
 use vm_superio::Trigger;
@@ -39,7 +39,7 @@ impl Trigger for EventWrapper {
 pub struct EventLoop<T> {
     epoll: Rc<Epoll>,
     events: Vec<EpollEvent>,
-    callbacks: Slab<T>,
+    callbacks: Rc<RefCell<Slab<T>>>,
 }
 
 impl<T> EventLoop<T> {
@@ -52,13 +52,13 @@ impl<T> EventLoop<T> {
         Ok(Self {
             epoll,
             events: vec![unsafe { zeroed() }; size],
-            callbacks: Slab::new(),
+            callbacks: Rc::new(RefCell::new(Slab::new())),
         })
     }
 
     pub fn register(&mut self, fd: &impl AsRawFd, event: EventSet, callback: T) -> io::Result<()> {
         let fd = fd.as_raw_fd();
-        let user_data = self.callbacks.insert(callback);
+        let user_data = self.callbacks.borrow_mut().insert(callback);
         self.epoll
             .ctl(
                 ControlOperation::Add,
@@ -66,14 +66,14 @@ impl<T> EventLoop<T> {
                 EpollEvent::new(event, user_data as u64),
             )
             .map_err(|e| {
-                let _ = self.callbacks.remove(user_data);
+                let _ = self.callbacks.borrow_mut().remove(user_data);
                 e
             })?;
         Ok(())
     }
 }
 
-pub trait EventHanderMut {
+pub trait EventHandlerMut {
     fn handle_event_mut(&mut self, events: EventSet);
 }
 
@@ -83,41 +83,48 @@ pub trait EventHandler {
 
 impl<T> EventLoop<T>
 where
-    T: EventHanderMut,
+    T: EventHandlerMut,
 {
     pub fn tick(&mut self, timeout: i32) -> io::Result<usize> {
         let n = self.epoll.wait(timeout, &mut self.events[..])?;
         for event in self.events.iter().take(n) {
-            self.callbacks[event.data() as usize].handle_event_mut(event.event_set());
+            self.callbacks.borrow_mut()[event.data() as usize].handle_event_mut(event.event_set());
         }
         Ok(n)
     }
 }
 
 #[derive(Debug)]
-pub struct PreRegister {
+pub struct PreRegister<T> {
     epoll: Rc<Epoll>,
+    callbacks: Rc<RefCell<Slab<T>>>,
     user_data: usize,
 }
 
 impl<T> EventLoop<T> {
-    pub fn pre_register(&mut self, callback: T) -> PreRegister {
-        let user_data = self.callbacks.insert(callback);
+    pub fn pre_register(&mut self, callback: T) -> PreRegister<T> {
+        let user_data = self.callbacks.borrow_mut().insert(callback);
         PreRegister {
             epoll: self.epoll.clone(),
+            callbacks: self.callbacks.clone(),
             user_data,
         }
     }
 }
 
-impl PreRegister {
+impl<T> PreRegister<T> {
     pub fn associate(&self, fd: &impl AsRawFd, event: EventSet) -> io::Result<()> {
         let fd = fd.as_raw_fd();
-        self.epoll.ctl(
-            ControlOperation::Add,
-            fd,
-            EpollEvent::new(event, self.user_data as u64)
-        )?;
+        self.epoll
+            .ctl(
+                ControlOperation::Add,
+                fd,
+                EpollEvent::new(event, self.user_data as u64),
+            )
+            .map_err(|e| {
+                let _ = self.callbacks.borrow_mut().remove(self.user_data);
+                e
+            })?;
         Ok(())
     }
 }

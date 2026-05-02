@@ -111,30 +111,21 @@ impl MMIOTransport {
 
         match missing_bits {
             ACKNOWLEDGE if self.device_status == INIT => self.device_status = status,
-            DRIVER if self.device_status == ACKNOWLEDGE => {
-                self.device_status = status;
-            }
+            DRIVER if self.device_status == ACKNOWLEDGE => self.device_status = status,
             FEATURES_OK if self.device_status == (ACKNOWLEDGE | DRIVER) => {
                 self.device_status = status;
             }
             DRIVER_OK if self.device_status == (ACKNOWLEDGE | DRIVER | FEATURES_OK) => {
                 self.device_status = status;
                 let mut locked_device = self.device.lock().unwrap();
-                let device_activated = locked_device.is_activated();
-
-                if !device_activated
-                    && locked_device
-                        .queues()
-                        .iter()
-                        .all(|q: &Queue| q.is_valid(&self.mem))
+                if !locked_device.is_activated()
+                    && locked_device.queues().iter().all(|q: &Queue| q.is_valid(&self.mem))
+                    && locked_device.activate(self.mem.clone()).is_err()
                 {
-                    let activate_result = locked_device.activate(self.mem.clone());
-                    if activate_result.is_err() {
-                        self.device_status |= DEVICE_NEEDS_RESET;
+                    self.device_status |= DEVICE_NEEDS_RESET;
 
-                        let _ = locked_device.interrupt_trigger().trigger(); //there was a trigger type here IrqType::Config
-                        //no clue what is supposed ot happen here, probably just trigger() with no type+
-                    }
+                    let _ = locked_device.interrupt_trigger().trigger(); //there was a trigger type here IrqType::Config
+                    //no clue what is supposed ot happen here, probably just trigger() with no type+
                 }
             }
             _ if (status & FAILED) != 0 => {
@@ -144,16 +135,8 @@ impl MMIOTransport {
 
             _ if status == 0 => {
                 let mut locked_device = self.device.lock().unwrap();
-                if locked_device.is_activated() {
-                    let mut device_status = self.device_status;
-                    let reset_result = locked_device.reset();
-                    match reset_result {
-                        Some((_interrupt_evt, mut _queue_evts)) => {}
-                        None => {
-                            device_status |= FAILED;
-                        }
-                    }
-                    self.device_status = device_status;
+                if locked_device.is_activated() && locked_device.reset().is_none() {
+                    self.device_status |= FAILED;
                 }
 
                 if self.device_status & FAILED == 0 {
@@ -262,7 +245,7 @@ impl MMIOTransport {
         }
     }
 
-    fn features_for_page(&mut self) -> u32 {
+    fn features_for_page(&self) -> u32 {
         let mut features = self
             .device
             .lock()

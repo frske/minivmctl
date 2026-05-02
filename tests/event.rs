@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use scratch_new::event::{EventHanderMut, EventLoop, EventWrapper};
+use scratch_new::event::{EventHandlerMut, EventLoop, EventWrapper};
 use vmm_sys_util::epoll::EventSet;
 use vm_superio::Trigger;
 
@@ -8,7 +8,7 @@ struct Recorder {
     seen: Arc<Mutex<Vec<EventSet>>>,
 }
 
-impl EventHanderMut for Recorder {
+impl EventHandlerMut for Recorder {
     fn handle_event_mut(&mut self, events: EventSet) {
         self.seen.lock().unwrap().push(events);
     }

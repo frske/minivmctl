@@ -1,5 +1,6 @@
 use std::{
     fs::File,
+    fmt,
     io::{self, Read, Seek, SeekFrom, Write},
     ops::Deref,
     sync::{
@@ -166,7 +167,6 @@ enum ParseError {
 
 #[derive(Debug)]
 enum ExecuteError {
-    GuestMemory,
     InvalidAccess,
     InvalidDataLength,
     Read(u32),
@@ -184,6 +184,22 @@ impl ExecuteError {
         }
     }
 }
+
+impl fmt::Display for ExecuteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidAccess => f.write_str("invalid access"),
+            Self::InvalidDataLength => f.write_str("invalid data length"),
+            Self::Read(partial) => write!(f, "read error after {partial} bytes"),
+            Self::Seek(err) => write!(f, "seek error: {err}"),
+            Self::Unsupported(value) => write!(f, "unsupported request type {value}"),
+            Self::Write(err) => write!(f, "write error: {err}"),
+            Self::Flush(err) => write!(f, "flush error: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for ExecuteError {}
 
 #[derive(Debug)]
 enum CompleteError {

@@ -100,9 +100,9 @@ impl ConfigSpace {
         self.0.as_slice()
     }
 
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.0.as_mut_slice()
-    }
+    // fn as_mut_slice(&mut self) -> &mut [u8] {
+    //     self.0.as_mut_slice()
+    // }
 }
 
 enum DeviceState {
@@ -121,10 +121,10 @@ impl DeviceState {
         matches!(self, Self::Activated { .. })
     }
 
-    fn unwrap(&self) -> GuestMemoryMmap {
+    fn mem(&self) -> Option<GuestMemoryMmap> {
         match self {
-            Self::Activated { mem } => mem.clone(),
-            Self::Inactive => panic!("device not activated"),
+            Self::Activated { mem } => Some(mem.clone()),
+            Self::Inactive => None,
         }
     }
 }
@@ -354,7 +354,7 @@ where
         if let Some(config_space_bytes) = self.config_space.as_slice().get(offset as usize..) {
             let len = config_space_bytes.len().min(data.len());
             data[..len].copy_from_slice(&config_space_bytes[..len]);
-            println!("write config space {len}");
+            println!("read config space {len}");
         }
     }
 
@@ -409,7 +409,9 @@ where
     }
 
     pub fn process_tx(&mut self) -> io::Result<()> {
-        let mem = self.state.unwrap();
+        let mem = self.state.mem().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "net device not activated")
+        })?;
         let queue = &mut self.queues[TX_INDEX];
 
         let mut try_notify = false;
@@ -445,7 +447,9 @@ where
     }
 
     pub fn process_rx(&mut self) -> io::Result<()> {
-        let mem = self.state.unwrap();
+        let mem = self.state.mem().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "net device not activated")
+        })?;
         let queue = &mut self.queues[RX_INDEX];
 
         let mut try_notify = false;

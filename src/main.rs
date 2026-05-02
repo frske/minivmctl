@@ -62,7 +62,7 @@ fn main() {
     let virtio_net = Arc::new(Mutex::new(virtio_net));
     mmio_bus
         .insert_virtio(MMIO_MEM_START, virtio_net.clone(), guest_mem.clone())
-        .unwrap();
+        .expect("insert virtio net mmio");
 
     let virtio_blk = Blk::new(
         OpenOptions::new()
@@ -85,7 +85,7 @@ fn main() {
     let virtio_blk = Arc::new(Mutex::new(virtio_blk));
     mmio_bus
         .insert_virtio(BLK_MMIO_MEM_START, virtio_blk.clone(), guest_mem.clone())
-        .unwrap();
+        .expect("insert virtio blk mmio");
 
     let com_evt_1 = EventWrapper::new();
     vm.register_irqfd(&com_evt_1.0, 4).unwrap();
@@ -139,7 +139,7 @@ fn main() {
                             flush_pending_stdin(&stdio_serial, &mut pending_stdin);
                         }
                         Err(e) => {
-                            println!("error while reading stdin: {:?}", e);
+                            eprintln!("error while reading stdin: {:?}", e);
                         }
                     }
                 }
@@ -209,7 +209,7 @@ fn spawn_vcpu_runtime(
                         break;
                     }
                     VcpuExit::Shutdown => {
-                        println!("KVM_EXIT_SHIUTDOWN");
+                        println!("KVM_EXIT_SHUTDOWN");
                         break;
                     }
                     r => {

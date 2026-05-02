@@ -12,6 +12,13 @@ pub struct Bus<A, D> {
     devices: Vec<BusDevice<A, D>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusError {
+    EmptyRange,
+    Overlap,
+    AddressOverflow,
+}
+
 struct BusDevice<A, D> {
     range: Range<A>,
     device: Arc<Mutex<D>>,
@@ -27,9 +34,9 @@ where
         Self { devices: Vec::new() }
     }
 
-    pub fn insert(&mut self, range: Range<A>, device: Arc<Mutex<D>>) -> Result<(), ()> {
+    pub fn insert(&mut self, range: Range<A>, device: Arc<Mutex<D>>) -> Result<(), BusError> {
         if range.is_empty() {
-            return Err(());
+            return Err(BusError::EmptyRange);
         }
 
         let insert_idx = self
@@ -37,11 +44,11 @@ where
             .partition_point(|d| d.range.start < range.start);
 
         if insert_idx > 0 && self.devices[insert_idx - 1].range.end > range.start {
-            return Err(());
+            return Err(BusError::Overlap);
         }
 
         if insert_idx < self.devices.len() && range.end > self.devices[insert_idx].range.start {
-            return Err(());
+            return Err(BusError::Overlap);
         }
 
         self.devices.insert(insert_idx, BusDevice { range, device });
@@ -121,9 +128,12 @@ impl PIOBus {
         &mut self,
         address: u16,
         serial: Arc<Mutex<PIODevice>>,
-    ) -> Result<(), ()> {
+    ) -> Result<(), BusError> {
         const SERIAL_PORT_SIZE: u16 = 0x8;
-        self.insert(address..address + SERIAL_PORT_SIZE, serial)
+        let end = address
+            .checked_add(SERIAL_PORT_SIZE)
+            .ok_or(BusError::AddressOverflow)?;
+        self.insert(address..end, serial)
     }
 }
 
@@ -133,10 +143,13 @@ impl MMIOBus {
         address: u64,
         device: Arc<Mutex<dyn VirtioDevice>>,
         mem: GuestMemoryMmap,
-    ) -> Result<(), ()> {
+    ) -> Result<(), BusError> {
         const MMIO_SIZE: u64 = 0x1000;
         let device = MMIODevice::MMIOTransport(MMIOTransport::new(device, mem));
-        self.insert(address..address + MMIO_SIZE, Arc::new(Mutex::new(device)))
+        let end = address
+            .checked_add(MMIO_SIZE)
+            .ok_or(BusError::AddressOverflow)?;
+        self.insert(address..end, Arc::new(Mutex::new(device)))
     }
 }
 
