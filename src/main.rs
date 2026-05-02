@@ -5,14 +5,6 @@ use std::{
     time::Duration,
 };
 
-mod event;
-mod blk;
-mod mmio;
-mod net;
-mod serial;
-mod virtio;
-mod bus;
-
 use kvm_bindings::{
     KVM_MAX_CPUID_ENTRIES, KVM_MEM_LOG_DIRTY_PAGES, KVM_PIT_SPEAKER_DUMMY, kvm_pit_config,
     kvm_segment, kvm_userspace_memory_region,
@@ -30,10 +22,11 @@ use vmm_sys_util::{
     terminal::Terminal,
 };
 
-use crate::{
+use scratch_new::{
     blk::Blk,
     bus::MMIOBus,
     event::EventWrapper,
+    net,
     serial::DummySerialEvent,
     virtio::VirtioDevice,
 };
