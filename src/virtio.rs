@@ -369,6 +369,7 @@ mod tests {
         (queue, mem)
     }
 
+    // Bad descriptor index rejected.
     #[test]
     fn descriptor_chain_rejects_invalid_index() {
         let mem = guest_memory(0x10_000);
@@ -376,6 +377,7 @@ mod tests {
         assert!(DescriptorChain::new(&mem, GuestAddress(0x1000), 2, 2).is_err());
     }
 
+    // Chain follows NEXT bit.
     #[test]
     fn descriptor_chain_follows_next_flag() {
         let mem = guest_memory(0x10_000);
@@ -401,6 +403,7 @@ mod tests {
         assert_eq!(next.addr, 0x5000);
     }
 
+    // No NEXT bit ends chain.
     #[test]
     fn descriptor_chain_without_next_flag_returns_none() {
         let mem = guest_memory(0x10_000);
@@ -418,6 +421,7 @@ mod tests {
         assert!(chain.next().is_none());
     }
 
+    // Writes can span descriptors.
     #[test]
     fn descriptor_chain_write_at_spans_descriptors() {
         let mem = guest_memory(0x10_000);
@@ -446,6 +450,7 @@ mod tests {
         assert_eq!(&buf[..2], b"cd");
     }
 
+    // Empty writes no-op, overflow errors.
     #[test]
     fn descriptor_chain_write_at_edges() {
         let mem = guest_memory(0x10_000);
@@ -469,6 +474,7 @@ mod tests {
         assert!(chain.write_at(5, b"x").is_err());
     }
 
+    // Valid queue layout accepted.
     #[test]
     fn queue_is_valid_accepts_well_formed_layout() {
         let (queue, mem) = valid_queue();
@@ -476,6 +482,7 @@ mod tests {
         assert!(queue.is_valid(&mem));
     }
 
+    // Invalid queue layout rejected.
     #[test]
     fn queue_is_valid_rejects_bad_layouts() {
         let (mut queue, mem) = valid_queue();
@@ -503,6 +510,7 @@ mod tests {
         assert!(!queue.is_valid(&mem));
     }
 
+    // Pop reads avail ring.
     #[test]
     fn queue_pop_reads_avail_ring() {
         let (mut queue, mem) = valid_queue();
@@ -521,6 +529,7 @@ mod tests {
         assert_eq!(queue.next_avail.0, 1);
     }
 
+    // Empty queue yields none.
     #[test]
     fn queue_pop_returns_none_when_empty() {
         let (mut queue, mem) = valid_queue();
@@ -528,6 +537,7 @@ mod tests {
         assert!(queue.pop(&mem).unwrap().is_none());
     }
 
+    // Bad descriptor keeps index still.
     #[test]
     fn queue_pop_invalid_descriptor_does_not_advance() {
         let (mut queue, mem) = valid_queue();
@@ -540,6 +550,7 @@ mod tests {
         assert_eq!(queue.next_avail.0, 0);
     }
 
+    // Undo pop steps back one slot.
     #[test]
     fn queue_undo_pop_rewinds_index() {
         let (mut queue, _mem) = valid_queue();
@@ -550,6 +561,7 @@ mod tests {
         assert_eq!(queue.next_avail.0, 1);
     }
 
+    // Push writes used ring entry.
     #[test]
     fn queue_push_writes_used_entry() {
         let (mut queue, mem) = valid_queue();
@@ -567,6 +579,7 @@ mod tests {
         assert_eq!(queue.num_added.0, 1);
     }
 
+    // Notify checks avail flags.
     #[test]
     fn queue_prepare_notify_without_suppression_checks_flags() {
         let (mut queue, mem) = valid_queue();
@@ -578,6 +591,7 @@ mod tests {
         assert!(!queue.prepare_notify(&mem));
     }
 
+    // Suppress mode uses event idx.
     #[test]
     fn queue_prepare_notify_with_suppression_uses_event_idx() {
         let (mut queue, mem) = valid_queue();

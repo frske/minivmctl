@@ -402,6 +402,7 @@ mod tests {
         mem.write_obj(0u16, queue.avail_ring.unchecked_add(4)).unwrap();
     }
 
+    // Basic MMIO registers read back right values.
     #[test]
     fn mmio_reports_basic_registers_and_features() {
         let (_device, mut transport) = transport_with_device(FakeDevice::new((1u64 << 40) | 0x12, 1, true));
@@ -425,6 +426,7 @@ mod tests {
         assert_eq!(u32::from_le_bytes(data), 0x101);
     }
 
+    // Unsupported feature bits are masked out per page.
     #[test]
     fn mmio_ack_features_masks_unsupported_bits() {
         let (device, mut transport) = transport_with_device(FakeDevice::new((1u64 << 40) | 0x12, 1, true));
@@ -446,6 +448,7 @@ mod tests {
         assert_eq!(guard.acked_features, (1u64 << 40) | 0x12);
     }
 
+    // Queue writes wait for FEATURES_OK.
     #[test]
     fn mmio_queue_writes_apply_only_after_features_ok() {
         let (device, mut transport) = transport_with_device(FakeDevice::new(0, 1, true));
@@ -465,6 +468,7 @@ mod tests {
         assert_eq!(u32::from_le_bytes(data), 8);
     }
 
+    // Valid queues activate device.
     #[test]
     fn mmio_driv_ok_activates_valid_queues() {
         let (device, _transport) = transport_with_device(FakeDevice::new(0, 1, true));
@@ -498,6 +502,7 @@ mod tests {
         assert_eq!(guard.activate_calls, 1);
     }
 
+    // Status zero resets device state.
     #[test]
     fn mmio_reset_clears_state_on_zero_status() {
         let (device, _transport) = transport_with_device(FakeDevice::new(0, 1, true));
@@ -526,6 +531,7 @@ mod tests {
         assert!(!guard.queues[0].ready);
     }
 
+    // Config space read routes to device.
     #[test]
     fn mmio_config_reads_forward_to_device() {
         let (_device, mut transport) = transport_with_device(FakeDevice::new(0, 1, true));

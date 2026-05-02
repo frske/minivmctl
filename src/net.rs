@@ -738,6 +738,7 @@ mod tests {
         (net, tap, mem)
     }
 
+    // WouldBlock rewinds queue.
     #[test]
     fn process_rx_wouldblock_undoes_pop() {
         let mut tap = FakeTap::new();
@@ -757,6 +758,7 @@ mod tests {
         assert_eq!(tap.0.lock().unwrap().read_calls, 1);
     }
 
+    // RX success writes header and used ring.
     #[test]
     fn process_rx_success_writes_header_and_used_entry() {
         let mut tap = FakeTap::new();
@@ -782,6 +784,7 @@ mod tests {
         assert_eq!(tap.0.lock().unwrap().read_calls, 1);
     }
 
+    // TX success updates used ring.
     #[test]
     fn process_tx_success_pushes_used_entry() {
         let mut tap = FakeTap::new();
@@ -805,6 +808,7 @@ mod tests {
         assert_eq!(tap.0.lock().unwrap().write_calls, 1);
     }
 
+    // TX WouldBlock still completes used entry.
     #[test]
     fn process_tx_wouldblock_pushes_used_entry() {
         let mut tap = FakeTap::new();
@@ -828,6 +832,7 @@ mod tests {
         assert_eq!(tap.0.lock().unwrap().write_calls, 1);
     }
 
+    // Event idx flips notif suppress.
     #[test]
     fn activate_with_event_idx_enables_notif_suppress() {
         let (mut net, _tap, mem) = setup_net(SharedTap::new(FakeTap::new().with_probe_features(0)));
@@ -841,6 +846,7 @@ mod tests {
         assert_eq!(net.activate_event.read().unwrap(), 1);
     }
 
+    // No event idx, no suppress.
     #[test]
     fn activate_without_event_idx_leaves_notif_suppress_off() {
         let (mut net, _tap, mem) = setup_net(SharedTap::new(FakeTap::new()));
@@ -851,6 +857,7 @@ mod tests {
         assert!(!net.queues()[1].notif_suppress);
     }
 
+    // Virtio bits map to TAP bits.
     #[test]
     fn tap_offload_maps_tun_to_virtio_features() {
         let offload = TapOffload::from_virtio_features((1 << 0) | (1 << 1) | (1 << 7) | (1 << 11));
@@ -862,12 +869,14 @@ mod tests {
         assert_ne!(virtio & (1 << 11), 0);
     }
 
+    // Checksum bit required.
     #[test]
     fn tap_offload_requires_checksum_bit() {
         assert_eq!(TapOffload::from_virtio_features(1 << 7).into_inner(), 0);
         assert_eq!(TapOffload::from_virtio_features(0).virtio_features(), 0);
     }
 
+    // Feature roundtrip stays stable.
     #[test]
     fn tap_offload_roundtrips_supported_features() {
         let features = (1 << 0) | (1 << 1) | (1 << 7) | (1 << 54) | (1 << 55);
@@ -876,6 +885,7 @@ mod tests {
         assert_eq!(offload.into_inner(), libc::TUN_F_CSUM | 0x02 | 0x20 | 0x40);
     }
 
+    // I/O vec honors perms.
     #[test]
     fn descriptor_chain_into_iovec_matches_permissions() {
         let mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10_000)]).unwrap();
@@ -895,6 +905,7 @@ mod tests {
         assert_eq!(iov.len(), 1);
     }
 
+    // Wrong perms rejected.
     #[test]
     fn descriptor_chain_into_iovec_rejects_mismatch() {
         let mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10_000)]).unwrap();

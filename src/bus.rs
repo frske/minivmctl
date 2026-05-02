@@ -193,6 +193,7 @@ mod tests {
         Arc::new(Mutex::new(RecordingDevice::default()))
     }
 
+    // Adjacent ranges stay valid.
     #[test]
     fn insert_accepts_adjacent_ranges() {
         let mut bus = Bus::new();
@@ -203,6 +204,7 @@ mod tests {
         assert!(bus.insert(10..20, dev2).is_ok());
     }
 
+    // Empty range rejected.
     #[test]
     fn insert_rejects_empty_range() {
         let mut bus = Bus::new();
@@ -210,6 +212,7 @@ mod tests {
         assert!(bus.insert(5u16..5, recording_device()).is_err());
     }
 
+    // Overlap with later range rejected.
     #[test]
     fn insert_rejects_overlap_with_next_range() {
         let mut bus = Bus::new();
@@ -218,6 +221,7 @@ mod tests {
         assert!(bus.insert(0..15, recording_device()).is_err());
     }
 
+    // Overlap with earlier range rejected.
     #[test]
     fn insert_rejects_overlap_with_previous_range() {
         let mut bus = Bus::new();
@@ -226,6 +230,7 @@ mod tests {
         assert!(bus.insert(5..6, recording_device()).is_err());
     }
 
+    // Lookup returns matching device.
     #[test]
     fn get_returns_matching_device() {
         let mut bus = Bus::new();
@@ -238,6 +243,7 @@ mod tests {
         assert!(Arc::ptr_eq(got, &dev));
     }
 
+    // Range start inclusive, end exclusive.
     #[test]
     fn get_respects_range_boundaries() {
         let mut bus = Bus::new();
@@ -249,6 +255,7 @@ mod tests {
         assert!(bus.get(&0x1010).is_none());
     }
 
+    // Read uses base-relative offset.
     #[test]
     fn read_routes_offset_relative_to_base() {
         let mut bus = Bus::new();
@@ -264,6 +271,7 @@ mod tests {
         assert_eq!(guard.reads, vec![(3, 4)]);
     }
 
+    // Write uses base-relative offset.
     #[test]
     fn write_routes_offset_relative_to_base() {
         let mut bus = Bus::new();
@@ -277,6 +285,7 @@ mod tests {
         assert_eq!(guard.writes, vec![(7, vec![1, 2, 3])]);
     }
 
+    // Miss returns false.
     #[test]
     fn io_returns_false_on_miss() {
         let mut bus: Bus<u16, RecordingDevice> = Bus::new();
