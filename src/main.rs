@@ -39,7 +39,7 @@ use crate::{
 
 type HostSerial = Serial<EventWrapper, DummySerialEvent, std::io::Stdout>;
 
-const MEMORY_SIZE: usize = 128 << 20;
+const MEMORY_SIZE: usize = 512 << 20;
 const BOOT_GDT_OFFSET: u64 = 0x500;
 const X86_CR0_PG: u64 = 0x80000000;
 const X86_CR4_PAE: u64 = 0x20;
