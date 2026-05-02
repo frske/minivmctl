@@ -1,13 +1,12 @@
 use std::{
     ops::Sub,
     ops::Range,
-    process::Output,
     sync::{Arc, Mutex},
 };
 
-use vm_memory::{GuestMemoryMmap, address};
+use vm_memory::GuestMemoryMmap;
 
-use crate::{mmio::MMIOTransport, serial, virtio::VirtioDevice};
+use crate::{mmio::MMIOTransport, virtio::VirtioDevice};
 
 pub struct Bus<A, D> {
     devices: Vec<BusDevice<A, D>>,
@@ -36,6 +35,10 @@ where
         let insert_idx = self
             .devices
             .partition_point(|d| d.range.start < range.start);
+
+        if insert_idx > 0 && self.devices[insert_idx - 1].range.end > range.start {
+            return Err(());
+        }
 
         if insert_idx < self.devices.len() && range.end > self.devices[insert_idx].range.start {
             return Err(());
@@ -114,7 +117,11 @@ pub enum MMIODevice {
 }
 
 impl PIOBus {
-    pub fn insert_serial(&mut self, address: u16, serial: Arc<Mutex<PIODevice>>) -> Result<(), ()> {
+    pub fn insert_serial(
+        &mut self,
+        address: u16,
+        serial: Arc<Mutex<PIODevice>>,
+    ) -> Result<(), ()> {
         const SERIAL_PORT_SIZE: u16 = 0x8;
         self.insert(address..address + SERIAL_PORT_SIZE, serial)
     }
@@ -154,5 +161,128 @@ impl DeviceIO for MMIODevice {
         match self {
             MMIODevice::MMIOTransport(mmio) => mmio.bus_write(offset, data),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default, Debug)]
+    struct RecordingDevice {
+        reads: Vec<(u16, usize)>,
+        writes: Vec<(u16, Vec<u8>)>,
+    }
+
+    impl DeviceIO for RecordingDevice {
+        type Offset = u16;
+
+        fn read(&mut self, offset: Self::Offset, data: &mut [u8]) {
+            self.reads.push((offset, data.len()));
+            for (idx, byte) in data.iter_mut().enumerate() {
+                *byte = offset as u8 + idx as u8;
+            }
+        }
+
+        fn write(&mut self, offset: Self::Offset, data: &[u8]) {
+            self.writes.push((offset, data.to_vec()));
+        }
+    }
+
+    fn recording_device() -> Arc<Mutex<RecordingDevice>> {
+        Arc::new(Mutex::new(RecordingDevice::default()))
+    }
+
+    #[test]
+    fn insert_accepts_adjacent_ranges() {
+        let mut bus = Bus::new();
+        let dev1 = recording_device();
+        let dev2 = recording_device();
+
+        assert!(bus.insert(0u16..10, dev1).is_ok());
+        assert!(bus.insert(10..20, dev2).is_ok());
+    }
+
+    #[test]
+    fn insert_rejects_empty_range() {
+        let mut bus = Bus::new();
+
+        assert!(bus.insert(5u16..5, recording_device()).is_err());
+    }
+
+    #[test]
+    fn insert_rejects_overlap_with_next_range() {
+        let mut bus = Bus::new();
+
+        assert!(bus.insert(10u16..20, recording_device()).is_ok());
+        assert!(bus.insert(0..15, recording_device()).is_err());
+    }
+
+    #[test]
+    fn insert_rejects_overlap_with_previous_range() {
+        let mut bus = Bus::new();
+
+        assert!(bus.insert(0u16..10, recording_device()).is_ok());
+        assert!(bus.insert(5..6, recording_device()).is_err());
+    }
+
+    #[test]
+    fn get_returns_matching_device() {
+        let mut bus = Bus::new();
+        let dev = recording_device();
+
+        assert!(bus.insert(0x1000u16..0x1010, dev.clone()).is_ok());
+
+        let (base, got) = bus.get(&0x1004).expect("device present");
+        assert_eq!(*base, 0x1000);
+        assert!(Arc::ptr_eq(got, &dev));
+    }
+
+    #[test]
+    fn get_respects_range_boundaries() {
+        let mut bus = Bus::new();
+        let dev = recording_device();
+
+        assert!(bus.insert(0x1000u16..0x1010, dev).is_ok());
+        assert!(bus.get(&0x1000).is_some());
+        assert!(bus.get(&0x100f).is_some());
+        assert!(bus.get(&0x1010).is_none());
+    }
+
+    #[test]
+    fn read_routes_offset_relative_to_base() {
+        let mut bus = Bus::new();
+        let dev = recording_device();
+
+        assert!(bus.insert(0x1000u16..0x1010, dev.clone()).is_ok());
+
+        let mut data = [0u8; 4];
+        assert!(bus.read(0x1003, &mut data));
+        assert_eq!(data, [3, 4, 5, 6]);
+
+        let guard = dev.lock().unwrap();
+        assert_eq!(guard.reads, vec![(3, 4)]);
+    }
+
+    #[test]
+    fn write_routes_offset_relative_to_base() {
+        let mut bus = Bus::new();
+        let dev = recording_device();
+
+        assert!(bus.insert(0x2000u16..0x2010, dev.clone()).is_ok());
+
+        assert!(bus.write(0x2007, &[1, 2, 3]));
+
+        let guard = dev.lock().unwrap();
+        assert_eq!(guard.writes, vec![(7, vec![1, 2, 3])]);
+    }
+
+    #[test]
+    fn io_returns_false_on_miss() {
+        let mut bus: Bus<u16, RecordingDevice> = Bus::new();
+
+        let mut data = [0u8; 2];
+        assert!(!bus.read(0x10, &mut data));
+        assert!(!bus.write(0x10, &[1, 2]));
     }
 }

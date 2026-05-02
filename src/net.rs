@@ -134,6 +134,14 @@ pub struct Tap {
     buffer: Vec<libc::iovec>,
 }
 
+unsafe impl Send for Tap {}
+
+pub trait NetIo {
+    fn probe(&self) -> TapOffload;
+    fn readv<B: IntoIoVec>(&mut self, data: B) -> io::Result<usize>;
+    fn writev<B: IntoIoVec>(&mut self, data: B) -> io::Result<usize>;
+}
+
 impl AsRawFd for Tap {
     fn as_raw_fd(&self) -> std::os::unix::prelude::RawFd {
         self.file.as_raw_fd()
@@ -224,6 +232,20 @@ impl Tap {
     }
 }
 
+impl NetIo for Tap {
+    fn probe(&self) -> TapOffload {
+        Tap::probe(self)
+    }
+
+    fn readv<B: IntoIoVec>(&mut self, data: B) -> io::Result<usize> {
+        Tap::readv(self, data)
+    }
+
+    fn writev<B: IntoIoVec>(&mut self, data: B) -> io::Result<usize> {
+        Tap::writev(self, data)
+    }
+}
+
 pub trait IntoIoVec {
     fn into_iovec(
         self,
@@ -271,8 +293,8 @@ where
 }
 
 //I have so many questions
-pub struct Net {
-    tap: Tap,
+pub struct Net<I = Tap> {
+    tap: I,
     avail_features: u64,
     acked_features: u64,
     queues: [Queue; NET_NUM_QUEUES],
@@ -285,9 +307,12 @@ pub struct Net {
     pub activate_event: EventFd,
 }
 
-unsafe impl Send for Net {}
+unsafe impl<I: Send> Send for Net<I> {}
 
-impl VirtioDevice for Net {
+impl<I> VirtioDevice for Net<I>
+where
+    I: NetIo + Send,
+{
     fn avail_features(&self) -> u64 {
         self.avail_features
     }
@@ -336,7 +361,7 @@ impl VirtioDevice for Net {
     fn write_config(&mut self, _offset: u32, _data: &[u8]) {}
 
     fn activate(&mut self, mem: GuestMemoryMmap) -> io::Result<()> {
-        if self.has_features(VIRTIO_RING_F_EVENT_IDX) {
+        if self.has_features(1u64 << VIRTIO_RING_F_EVENT_IDX) {
             for queue in &mut self.queues {
                 queue.notif_suppress = true;
             }
@@ -353,11 +378,11 @@ impl VirtioDevice for Net {
     }
 }
 
-impl Net {
-    pub fn new(name: &str, mac: Option<[u8; 6]>) -> io::Result<Self> {
-        let tap = Tap::new(name)?;
-        tap.set_vnet_hdr_size(12)?;
-
+impl<I> Net<I>
+where
+    I: NetIo,
+{
+    pub fn with_tap(tap: I, mac: Option<[u8; 6]>) -> io::Result<Self> {
         let mut avail_features = tap.probe().virtio_features();
         if mac.is_some() {
             avail_features |= 1 << VIRTIO_NET_F_MAC;
@@ -381,11 +406,6 @@ impl Net {
 
     pub fn interrupt_event(&self) -> &EventFd {
         &self.irq_trigger.irq_evt
-    }
-
-    pub fn register_tap_readable(&self, poll: &PollContext<u8>, token: u8) -> io::Result<()> {
-        poll.add(&self.tap, token)
-            .map_err(|e| io::Error::from_raw_os_error(e.errno()))
     }
 
     pub fn process_tx(&mut self) -> io::Result<()> {
@@ -469,29 +489,60 @@ impl Net {
     }
 }
 
+impl Net<Tap> {
+    pub fn new(name: &str, mac: Option<[u8; 6]>) -> io::Result<Self> {
+        let tap = Tap::new(name)?;
+        tap.set_vnet_hdr_size(12)?;
+        Net::with_tap(tap, mac)
+    }
+
+    pub fn register_tap_readable(&self, poll: &PollContext<u8>, token: u8) -> io::Result<()> {
+        poll.add(&self.tap, token)
+            .map_err(|e| io::Error::from_raw_os_error(e.errno()))
+    }
+}
+
 pub struct TapOffload(libc::c_uint);
 
 impl TapOffload {
     const AVAIL_MAPPING: [(libc::c_uint, u64); 7] = [
-        (TUN_F_CSUM, VIRTIO_NET_F_GUEST_CSUM | VIRTIO_NET_F_CSUM),
-        (TUN_F_TSO4, VIRTIO_NET_F_GUEST_TSO4 | VIRTIO_NET_F_HOST_TSO4),
-        (TUN_F_TSO6, VIRTIO_NET_F_GUEST_TSO6 | VIRTIO_NET_F_HOST_TSO6),
+        (
+            TUN_F_CSUM,
+            (1 << VIRTIO_NET_F_GUEST_CSUM) | (1 << VIRTIO_NET_F_CSUM),
+        ),
+        (
+            TUN_F_TSO4,
+            (1 << VIRTIO_NET_F_GUEST_TSO4) | (1 << VIRTIO_NET_F_HOST_TSO4),
+        ),
+        (
+            TUN_F_TSO6,
+            (1 << VIRTIO_NET_F_GUEST_TSO6) | (1 << VIRTIO_NET_F_HOST_TSO6),
+        ),
         (
             TUN_F_TSO_ECN,
-            VIRTIO_NET_F_GUEST_ECN | VIRTIO_NET_F_HOST_ECN,
+            (1 << VIRTIO_NET_F_GUEST_ECN) | (1 << VIRTIO_NET_F_HOST_ECN),
         ),
-        (TUN_F_UFO, VIRTIO_NET_F_GUEST_UFO | VIRTIO_NET_F_HOST_UFO),
-        (TUN_F_USO4, VIRTIO_NET_F_GUEST_USO4 | VIRTIO_NET_F_HOST_USO),
-        (TUN_F_USO6, VIRTIO_NET_F_GUEST_USO6 | VIRTIO_NET_F_HOST_USO),
+        (
+            TUN_F_UFO,
+            (1 << VIRTIO_NET_F_GUEST_UFO) | (1 << VIRTIO_NET_F_HOST_UFO),
+        ),
+        (
+            TUN_F_USO4,
+            (1 << VIRTIO_NET_F_GUEST_USO4) | (1 << VIRTIO_NET_F_HOST_USO),
+        ),
+        (
+            TUN_F_USO6,
+            (1 << VIRTIO_NET_F_GUEST_USO6) | (1 << VIRTIO_NET_F_HOST_USO),
+        ),
     ];
     const FEAT_MAPPING: [(u64, libc::c_uint); 7] = [
-        (VIRTIO_NET_F_GUEST_CSUM, TUN_F_CSUM),
-        (VIRTIO_NET_F_GUEST_TSO4, TUN_F_TSO4),
-        (VIRTIO_NET_F_GUEST_TSO6, TUN_F_TSO6),
-        (VIRTIO_NET_F_GUEST_ECN, TUN_F_TSO_ECN),
-        (VIRTIO_NET_F_GUEST_UFO, TUN_F_UFO),
-        (VIRTIO_NET_F_GUEST_USO4, TUN_F_USO4),
-        (VIRTIO_NET_F_GUEST_USO6, TUN_F_USO6),
+        (1 << VIRTIO_NET_F_GUEST_CSUM, TUN_F_CSUM),
+        (1 << VIRTIO_NET_F_GUEST_TSO4, TUN_F_TSO4),
+        (1 << VIRTIO_NET_F_GUEST_TSO6, TUN_F_TSO6),
+        (1 << VIRTIO_NET_F_GUEST_ECN, TUN_F_TSO_ECN),
+        (1 << VIRTIO_NET_F_GUEST_UFO, TUN_F_UFO),
+        (1 << VIRTIO_NET_F_GUEST_USO4, TUN_F_USO4),
+        (1 << VIRTIO_NET_F_GUEST_USO6, TUN_F_USO6),
     ];
 
     pub fn virtio_features(&self) -> u64 {
@@ -510,7 +561,7 @@ impl TapOffload {
     }
 
     pub fn from_virtio_features(features: u64) -> Self {
-        if features & VIRTIO_NET_F_CSUM == 0 {
+        if features & (1 << VIRTIO_NET_F_CSUM) == 0 {
             return Self(0);
         }
 
@@ -556,5 +607,304 @@ impl Tap {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::virtio::VirtioDevice;
+    use std::{collections::VecDeque, io, sync::{Arc, Mutex, atomic::Ordering}};
+    use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Descriptor {
+        addr: u64,
+        len: u32,
+        flags: u16,
+        next: u16,
+    }
+
+    unsafe impl ByteValued for Descriptor {}
+
+    #[derive(Clone, Copy)]
+    enum Action {
+        Ok(usize),
+        WouldBlock,
+    }
+
+    impl Action {
+        fn into_result(self) -> io::Result<usize> {
+            match self {
+                Self::Ok(n) => Ok(n),
+                Self::WouldBlock => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            }
+        }
+    }
+
+    struct FakeTap {
+        probe_features: u64,
+        reads: VecDeque<Action>,
+        writes: VecDeque<Action>,
+        read_calls: usize,
+        write_calls: usize,
+    }
+
+    #[derive(Clone)]
+    struct SharedTap(Arc<Mutex<FakeTap>>);
+
+    impl SharedTap {
+        fn new(tap: FakeTap) -> Self {
+            Self(Arc::new(Mutex::new(tap)))
+        }
+    }
+
+    impl FakeTap {
+        fn new() -> Self {
+            Self {
+                probe_features: 0,
+                reads: VecDeque::new(),
+                writes: VecDeque::new(),
+                read_calls: 0,
+                write_calls: 0,
+            }
+        }
+
+        fn with_probe_features(mut self, features: u64) -> Self {
+            self.probe_features = features;
+            self
+        }
+
+        fn push_read(&mut self, action: Action) {
+            self.reads.push_back(action);
+        }
+
+        fn push_write(&mut self, action: Action) {
+            self.writes.push_back(action);
+        }
+    }
+
+    impl NetIo for FakeTap {
+        fn probe(&self) -> TapOffload {
+            TapOffload::from_virtio_features(self.probe_features)
+        }
+
+        fn readv<B: IntoIoVec>(&mut self, _data: B) -> io::Result<usize> {
+            self.read_calls += 1;
+            self.reads.pop_front().unwrap_or(Action::Ok(0)).into_result()
+        }
+
+        fn writev<B: IntoIoVec>(&mut self, _data: B) -> io::Result<usize> {
+            self.write_calls += 1;
+            self.writes.pop_front().unwrap_or(Action::Ok(0)).into_result()
+        }
+    }
+
+    impl NetIo for SharedTap {
+        fn probe(&self) -> TapOffload {
+            self.0.lock().unwrap().probe()
+        }
+
+        fn readv<B: IntoIoVec>(&mut self, data: B) -> io::Result<usize> {
+            self.0.lock().unwrap().readv(data)
+        }
+
+        fn writev<B: IntoIoVec>(&mut self, data: B) -> io::Result<usize> {
+            self.0.lock().unwrap().writev(data)
+        }
+    }
+
+    fn write_descriptor(mem: &GuestMemoryMmap<()>, table: GuestAddress, index: u16, desc: Descriptor) {
+        mem.write_obj(desc, table.unchecked_add(u64::from(index) * 16)).unwrap();
+    }
+
+    fn setup_queue(mem: &GuestMemoryMmap<()>, queue: &mut Queue, flags: u16) {
+        queue.size = 8;
+        queue.ready = true;
+        queue.desc_table = GuestAddress(0x1000);
+        queue.avail_ring = GuestAddress(0x2000);
+        queue.used_ring = GuestAddress(0x3000);
+
+        write_descriptor(mem, queue.desc_table, 0, Descriptor { addr: 0x4000, len: 64, flags, next: 0 });
+        mem.write_obj(0u16, queue.avail_ring).unwrap();
+        mem.write_obj(1u16, queue.avail_ring.unchecked_add(2)).unwrap();
+        mem.write_obj(0u16, queue.avail_ring.unchecked_add(4)).unwrap();
+    }
+
+    fn setup_net(tap: SharedTap) -> (Net<SharedTap>, SharedTap, GuestMemoryMmap<()>) {
+        let mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x20_000)]).unwrap();
+        let net: Net<SharedTap> = Net::with_tap(tap.clone(), None).unwrap();
+        (net, tap, mem)
+    }
+
+    #[test]
+    fn process_rx_wouldblock_undoes_pop() {
+        let mut tap = FakeTap::new();
+        tap.push_read(Action::WouldBlock);
+        let tap = SharedTap::new(tap);
+
+        let (mut net, tap, mem) = setup_net(tap);
+        setup_queue(&mem, &mut net.queues_mut()[0], 2);
+        net.activate(mem.clone()).unwrap();
+
+        net.process_rx().unwrap();
+
+        let queue = &net.queues()[0];
+        assert_eq!(queue.next_avail.0, 0);
+        assert_eq!(queue.next_used.0, 0);
+        assert_eq!(net.interrupt_status().load(Ordering::SeqCst), 0);
+        assert_eq!(tap.0.lock().unwrap().read_calls, 1);
+    }
+
+    #[test]
+    fn process_rx_success_writes_header_and_used_entry() {
+        let mut tap = FakeTap::new();
+        tap.push_read(Action::Ok(64));
+        let tap = SharedTap::new(tap);
+
+        let (mut net, tap, mem) = setup_net(tap);
+        setup_queue(&mem, &mut net.queues_mut()[0], 2);
+        net.activate(mem.clone()).unwrap();
+
+        net.process_rx().unwrap();
+
+        let queue = &net.queues()[0];
+        let num_buffers: u16 = mem.read_obj(GuestAddress(0x4000 + 10)).unwrap();
+        let used_id: u32 = mem.read_obj(queue.used_ring.unchecked_add(4)).unwrap();
+        let used_len: u32 = mem.read_obj(queue.used_ring.unchecked_add(8)).unwrap();
+
+        assert_eq!(num_buffers, 1);
+        assert_eq!(used_id, 0);
+        assert_eq!(used_len, 64);
+        assert_eq!(queue.next_used.0, 1);
+        assert_eq!(net.interrupt_status().load(Ordering::SeqCst) & 1, 1);
+        assert_eq!(tap.0.lock().unwrap().read_calls, 1);
+    }
+
+    #[test]
+    fn process_tx_success_pushes_used_entry() {
+        let mut tap = FakeTap::new();
+        tap.push_write(Action::Ok(32));
+        let tap = SharedTap::new(tap);
+
+        let (mut net, tap, mem) = setup_net(tap);
+        setup_queue(&mem, &mut net.queues_mut()[1], 0);
+        net.activate(mem.clone()).unwrap();
+
+        net.process_tx().unwrap();
+
+        let queue = &net.queues()[1];
+        let used_id: u32 = mem.read_obj(queue.used_ring.unchecked_add(4)).unwrap();
+        let used_len: u32 = mem.read_obj(queue.used_ring.unchecked_add(8)).unwrap();
+
+        assert_eq!(used_id, 0);
+        assert_eq!(used_len, 0);
+        assert_eq!(queue.next_used.0, 1);
+        assert_eq!(net.interrupt_status().load(Ordering::SeqCst) & 1, 1);
+        assert_eq!(tap.0.lock().unwrap().write_calls, 1);
+    }
+
+    #[test]
+    fn process_tx_wouldblock_pushes_used_entry() {
+        let mut tap = FakeTap::new();
+        tap.push_write(Action::WouldBlock);
+        let tap = SharedTap::new(tap);
+
+        let (mut net, tap, mem) = setup_net(tap);
+        setup_queue(&mem, &mut net.queues_mut()[1], 0);
+        net.activate(mem.clone()).unwrap();
+
+        net.process_tx().unwrap();
+
+        let queue = &net.queues()[1];
+        let used_id: u32 = mem.read_obj(queue.used_ring.unchecked_add(4)).unwrap();
+        let used_len: u32 = mem.read_obj(queue.used_ring.unchecked_add(8)).unwrap();
+
+        assert_eq!(used_id, 0);
+        assert_eq!(used_len, 0);
+        assert_eq!(queue.next_used.0, 1);
+        assert_eq!(net.interrupt_status().load(Ordering::SeqCst) & 1, 1);
+        assert_eq!(tap.0.lock().unwrap().write_calls, 1);
+    }
+
+    #[test]
+    fn activate_with_event_idx_enables_notif_suppress() {
+        let (mut net, _tap, mem) = setup_net(SharedTap::new(FakeTap::new().with_probe_features(0)));
+        net.set_acked_features(1u64 << 29);
+        assert_ne!(net.acked_features() & (1u64 << 29), 0);
+
+        net.activate(mem).unwrap();
+
+        assert!(net.queues()[0].notif_suppress);
+        assert!(net.queues()[1].notif_suppress);
+        assert_eq!(net.activate_event.read().unwrap(), 1);
+    }
+
+    #[test]
+    fn activate_without_event_idx_leaves_notif_suppress_off() {
+        let (mut net, _tap, mem) = setup_net(SharedTap::new(FakeTap::new()));
+
+        net.activate(mem).unwrap();
+
+        assert!(!net.queues()[0].notif_suppress);
+        assert!(!net.queues()[1].notif_suppress);
+    }
+
+    #[test]
+    fn tap_offload_maps_tun_to_virtio_features() {
+        let offload = TapOffload::from_virtio_features((1 << 0) | (1 << 1) | (1 << 7) | (1 << 11));
+        let virtio = offload.virtio_features();
+
+        assert_ne!(virtio & (1 << 0), 0);
+        assert_ne!(virtio & (1 << 1), 0);
+        assert_ne!(virtio & (1 << 7), 0);
+        assert_ne!(virtio & (1 << 11), 0);
+    }
+
+    #[test]
+    fn tap_offload_requires_checksum_bit() {
+        assert_eq!(TapOffload::from_virtio_features(1 << 7).into_inner(), 0);
+        assert_eq!(TapOffload::from_virtio_features(0).virtio_features(), 0);
+    }
+
+    #[test]
+    fn tap_offload_roundtrips_supported_features() {
+        let features = (1 << 0) | (1 << 1) | (1 << 7) | (1 << 54) | (1 << 55);
+        let offload = TapOffload::from_virtio_features(features);
+
+        assert_eq!(offload.into_inner(), libc::TUN_F_CSUM | 0x02 | 0x20 | 0x40);
+    }
+
+    #[test]
+    fn descriptor_chain_into_iovec_matches_permissions() {
+        let mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10_000)]).unwrap();
+        let table = GuestAddress(0x1000);
+
+        write_descriptor(&mem, table, 0, Descriptor { addr: 0x4000, len: 4, flags: 0, next: 0 });
+
+        let chain = DescriptorChain::new(&mem, table, 2, 0).unwrap();
+        let mut buf = Vec::new();
+
+        let iov = chain.into_iovec(&mut buf, false).unwrap();
+        assert_eq!(iov.len(), 1);
+
+        write_descriptor(&mem, table, 0, Descriptor { addr: 0x5000, len: 4, flags: 2, next: 0 });
+        let chain = DescriptorChain::new(&mem, table, 2, 0).unwrap();
+        let iov = chain.into_iovec(&mut buf, true).unwrap();
+        assert_eq!(iov.len(), 1);
+    }
+
+    #[test]
+    fn descriptor_chain_into_iovec_rejects_mismatch() {
+        let mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10_000)]).unwrap();
+        let table = GuestAddress(0x1000);
+
+        write_descriptor(&mem, table, 0, Descriptor { addr: 0x4000, len: 4, flags: 2, next: 0 });
+
+        let chain = DescriptorChain::new(&mem, table, 1, 0).unwrap();
+        let mut buf = Vec::new();
+
+        assert!(chain.into_iovec(&mut buf, false).is_err());
     }
 }

@@ -17,12 +17,12 @@ pub struct DescriptorChain<M> {
     pub(crate) mem: M,
     desc_table: GuestAddress,
     queue_size: u16,
-    pub index: u16,
+    pub(crate) index: u16,
 
-    pub addr: u64,  //memroy address in Guest
-    pub len: u32,   //length of buffer
-    pub flags: u16, //readable, writable, has next
-    pub next: u16,  //next descriptor if index chained
+    pub(crate) addr: u64,  //memroy address in Guest
+    pub(crate) len: u32,   //length of buffer
+    pub(crate) flags: u16, //readable, writable, has next
+    pub(crate) next: u16,  //next descriptor if index chained
 }
 
 impl<M> DescriptorChain<M>
@@ -117,19 +117,19 @@ where
 }
 
 pub struct Queue {
-    pub desc_table: GuestAddress,
-    pub avail_ring: GuestAddress,
-    pub used_ring: GuestAddress,
+    pub(crate) desc_table: GuestAddress,
+    pub(crate) avail_ring: GuestAddress,
+    pub(crate) used_ring: GuestAddress,
 
-    pub size: u16,
-    pub ready: bool,
+    pub(crate) size: u16,
+    pub(crate) ready: bool,
 
-    pub next_avail: Wrapping<u16>,
-    pub next_used: Wrapping<u16>,
-    pub num_added: Wrapping<u16>,
+    pub(crate) next_avail: Wrapping<u16>,
+    pub(crate) next_used: Wrapping<u16>,
+    pub(crate) num_added: Wrapping<u16>,
 
-    pub max_size: u16,
-    pub notif_suppress: bool,
+    pub(crate) max_size: u16,
+    pub(crate) notif_suppress: bool,
 }
 
 impl Queue {
@@ -322,5 +322,272 @@ pub trait VirtioDevice: Send {
     fn is_activated(&self) -> bool;
     fn reset(&mut self) -> Option<(EventFd, Vec<EventFd>)> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Descriptor {
+        addr: u64,
+        len: u32,
+        flags: u16,
+        next: u16,
+    }
+
+    unsafe impl ByteValued for Descriptor {}
+
+    fn guest_memory(size: usize) -> GuestMemoryMmap<()> {
+        GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), size)]).unwrap()
+    }
+
+    fn write_descriptor(
+        mem: &GuestMemoryMmap<()>,
+        table: GuestAddress,
+        index: u16,
+        desc: Descriptor,
+    ) {
+        mem.write_obj(desc, table.unchecked_add(u64::from(index) * 16))
+            .unwrap();
+    }
+
+    fn write_u16(mem: &GuestMemoryMmap<()>, addr: GuestAddress, value: u16) {
+        mem.write_obj(value, addr).unwrap();
+    }
+
+    fn valid_queue() -> (Queue, GuestMemoryMmap<()>) {
+        let mem = guest_memory(0x20_000);
+        let mut queue = Queue::new(8);
+        queue.size = 8;
+        queue.ready = true;
+        queue.desc_table = GuestAddress(0x1000);
+        queue.avail_ring = GuestAddress(0x2000);
+        queue.used_ring = GuestAddress(0x3000);
+        (queue, mem)
+    }
+
+    #[test]
+    fn descriptor_chain_rejects_invalid_index() {
+        let mem = guest_memory(0x10_000);
+
+        assert!(DescriptorChain::new(&mem, GuestAddress(0x1000), 2, 2).is_err());
+    }
+
+    #[test]
+    fn descriptor_chain_follows_next_flag() {
+        let mem = guest_memory(0x10_000);
+        let table = GuestAddress(0x1000);
+
+        write_descriptor(
+            &mem,
+            table,
+            0,
+            Descriptor { addr: 0x4000, len: 4, flags: 1, next: 1 },
+        );
+        write_descriptor(
+            &mem,
+            table,
+            1,
+            Descriptor { addr: 0x5000, len: 4, flags: 0, next: 0 },
+        );
+
+        let chain = DescriptorChain::new(&mem, table, 2, 0).unwrap();
+        let next = chain.next().expect("next descriptor");
+
+        assert_eq!(next.index, 1);
+        assert_eq!(next.addr, 0x5000);
+    }
+
+    #[test]
+    fn descriptor_chain_without_next_flag_returns_none() {
+        let mem = guest_memory(0x10_000);
+        let table = GuestAddress(0x1000);
+
+        write_descriptor(
+            &mem,
+            table,
+            0,
+            Descriptor { addr: 0x4000, len: 4, flags: 0, next: 1 },
+        );
+
+        let chain = DescriptorChain::new(&mem, table, 2, 0).unwrap();
+
+        assert!(chain.next().is_none());
+    }
+
+    #[test]
+    fn descriptor_chain_write_at_spans_descriptors() {
+        let mem = guest_memory(0x10_000);
+        let table = GuestAddress(0x1000);
+
+        write_descriptor(
+            &mem,
+            table,
+            0,
+            Descriptor { addr: 0x4000, len: 4, flags: 1, next: 1 },
+        );
+        write_descriptor(
+            &mem,
+            table,
+            1,
+            Descriptor { addr: 0x5000, len: 4, flags: 0, next: 0 },
+        );
+
+        let chain = DescriptorChain::new(&mem, table, 2, 0).unwrap();
+        chain.write_at(2, b"abcd").unwrap();
+
+        let mut buf = [0u8; 4];
+        mem.read_slice(&mut buf, GuestAddress(0x4000 + 2)).unwrap();
+        assert_eq!(&buf[..2], b"ab");
+        mem.read_slice(&mut buf, GuestAddress(0x5000)).unwrap();
+        assert_eq!(&buf[..2], b"cd");
+    }
+
+    #[test]
+    fn descriptor_chain_write_at_edges() {
+        let mem = guest_memory(0x10_000);
+        let table = GuestAddress(0x1000);
+
+        write_descriptor(
+            &mem,
+            table,
+            0,
+            Descriptor { addr: 0x4000, len: 4, flags: 0, next: 0 },
+        );
+
+        let chain = DescriptorChain::new(&mem, table, 1, 0).unwrap();
+        assert!(chain.clone().write_at(0, b"").is_ok());
+
+        let mut buf = [0u8; 4];
+        mem.read_slice(&mut buf, GuestAddress(0x4000)).unwrap();
+        assert_eq!(buf, [0, 0, 0, 0]);
+
+        let chain = DescriptorChain::new(&mem, table, 1, 0).unwrap();
+        assert!(chain.write_at(5, b"x").is_err());
+    }
+
+    #[test]
+    fn queue_is_valid_accepts_well_formed_layout() {
+        let (queue, mem) = valid_queue();
+
+        assert!(queue.is_valid(&mem));
+    }
+
+    #[test]
+    fn queue_is_valid_rejects_bad_layouts() {
+        let (mut queue, mem) = valid_queue();
+
+        queue.ready = false;
+        assert!(!queue.is_valid(&mem));
+
+        queue.ready = true;
+        queue.size = 3;
+        assert!(!queue.is_valid(&mem));
+
+        queue.size = 16;
+        assert!(!queue.is_valid(&mem));
+
+        queue.size = 8;
+        queue.desc_table = GuestAddress(0x1003);
+        assert!(!queue.is_valid(&mem));
+
+        queue.desc_table = GuestAddress(0x1000);
+        queue.avail_ring = GuestAddress(0x2002);
+        assert!(!queue.is_valid(&mem));
+
+        queue.avail_ring = GuestAddress(0x2000);
+        queue.used_ring = GuestAddress(0x3001);
+        assert!(!queue.is_valid(&mem));
+    }
+
+    #[test]
+    fn queue_pop_reads_avail_ring() {
+        let (mut queue, mem) = valid_queue();
+        write_descriptor(
+            &mem,
+            queue.desc_table,
+            0,
+            Descriptor { addr: 0x4000, len: 8, flags: 0, next: 0 },
+        );
+        write_u16(&mem, queue.avail_ring, 0);
+        write_u16(&mem, queue.avail_ring.unchecked_add(2), 1);
+        write_u16(&mem, queue.avail_ring.unchecked_add(4), 0);
+
+        let desc = queue.pop(&mem).unwrap().expect("descriptor");
+        assert_eq!(desc.index, 0);
+        assert_eq!(queue.next_avail.0, 1);
+    }
+
+    #[test]
+    fn queue_pop_returns_none_when_empty() {
+        let (mut queue, mem) = valid_queue();
+
+        assert!(queue.pop(&mem).unwrap().is_none());
+    }
+
+    #[test]
+    fn queue_pop_invalid_descriptor_does_not_advance() {
+        let (mut queue, mem) = valid_queue();
+
+        write_u16(&mem, queue.avail_ring, 0);
+        write_u16(&mem, queue.avail_ring.unchecked_add(2), 1);
+        write_u16(&mem, queue.avail_ring.unchecked_add(4), 99);
+
+        assert!(queue.pop(&mem).is_err());
+        assert_eq!(queue.next_avail.0, 0);
+    }
+
+    #[test]
+    fn queue_undo_pop_rewinds_index() {
+        let (mut queue, _mem) = valid_queue();
+
+        queue.next_avail = std::num::Wrapping(2);
+        queue.undo_pop();
+
+        assert_eq!(queue.next_avail.0, 1);
+    }
+
+    #[test]
+    fn queue_push_writes_used_entry() {
+        let (mut queue, mem) = valid_queue();
+
+        queue.push(&mem, 7, 11);
+
+        let mut id = [0u8; 4];
+        let mut len = [0u8; 4];
+        mem.read_slice(&mut id, queue.used_ring.unchecked_add(4)).unwrap();
+        mem.read_slice(&mut len, queue.used_ring.unchecked_add(8)).unwrap();
+
+        assert_eq!(u32::from_le_bytes(id), 7);
+        assert_eq!(u32::from_le_bytes(len), 11);
+        assert_eq!(queue.next_used.0, 1);
+        assert_eq!(queue.num_added.0, 1);
+    }
+
+    #[test]
+    fn queue_prepare_notify_without_suppression_checks_flags() {
+        let (mut queue, mem) = valid_queue();
+
+        write_u16(&mem, queue.avail_ring, 0);
+        assert!(queue.prepare_notify(&mem));
+
+        write_u16(&mem, queue.avail_ring, 1);
+        assert!(!queue.prepare_notify(&mem));
+    }
+
+    #[test]
+    fn queue_prepare_notify_with_suppression_uses_event_idx() {
+        let (mut queue, mem) = valid_queue();
+
+        queue.notif_suppress = true;
+        queue.next_used = std::num::Wrapping(1);
+        queue.num_added = std::num::Wrapping(1);
+        write_u16(&mem, queue.avail_ring.unchecked_add(2 * 8 + 4), 0);
+
+        assert!(queue.prepare_notify(&mem));
+        assert_eq!(queue.num_added.0, 0);
     }
 }
