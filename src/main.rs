@@ -1,12 +1,12 @@
 use std::{
     collections::VecDeque,
-    fs::File,
-    io::Cursor,
+    fs::{File, OpenOptions},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 mod event;
+mod blk;
 mod mmio;
 mod net;
 mod serial;
@@ -31,6 +31,7 @@ use vmm_sys_util::{
 };
 
 use crate::{
+    blk::Blk,
     bus::MMIOBus,
     event::EventWrapper,
     serial::DummySerialEvent,
@@ -59,14 +60,16 @@ const EBDA_START: u64 = 0x9fc00;
 const FIRST_ADDR_PAST_32BITS: u64 = 1 << 32;
 const MEM_32BIT_GAP_SIZE: u64 = 768 << 20;
 const MMIO_MEM_START: u64 = FIRST_ADDR_PAST_32BITS - MEM_32BIT_GAP_SIZE;
+const BLK_MMIO_MEM_START: u64 = MMIO_MEM_START + 0x1000;
 
 const COM1: u16 = 0x3f8;
 
 const BOOT_CMD: &str =
-    "console=ttyS0 noapic noacpi reboot=k panic=1 pci=off net.ifnames=0 biosdevname=0 virtio_mmio.device=4K@0xd0000000:5";
-const KERNEL_PATH: &str = "/tmp/chinsav/vmlinux";
-const INITRD_PATH: &str = "/tmp/chinsav/initrd.img";
-
+    "console=ttyS0 noapic noacpi reboot=k panic=1 pci=off net.ifnames=0 biosdevname=0 root=/dev/vda rootwait rw virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0001000:6";
+// const KERNEL_PATH: &str = "/tmp/chinsav/vmlinux";
+// const BLOCK_PATH: &str = "/tmp/chinsav/rootfs.img";
+const KERNEL_PATH: &str = "/home/frsk/prj/kernel_images/linux-6.6.99/vmlinux";
+const BLOCK_PATH: &str = "/home/frsk/prj/kernel_images/rootfs.ext4";
 const HIMEM_START: u64 = 0x100000;
 const BOOT_CMD_START: u64 = 0x20000;
 const ZERO_PAGE_START: u64 = 0x7000;
@@ -76,6 +79,7 @@ const GUEST_MAC: [u8; 6] = [0x02, 0x12, 0x34, 0x56, 0x78, 0x9a];
 
 const NET_NUM_QUEUES: usize = 2;
 const TAP_RX_TOKEN: u8 = 3 + NET_NUM_QUEUES as u8;
+const BLK_QUEUE_TOKEN: u8 = TAP_RX_TOKEN + 1;
 
 fn main() {
     // VM and guest memory setup.
@@ -113,9 +117,8 @@ fn main() {
     write_gdt(&guest_mem, &mut sregs, CODE_SEG, DATA_SEG);
     vcpu.set_sregs(&sregs).unwrap();
 
-    let (initrd_addr, initrd_size) = load_initrd(&guest_mem);
     load_boot_cmdline(&guest_mem);
-    write_boot_params(&guest_mem, initrd_addr, initrd_size);
+    write_boot_params(&guest_mem);
 
     // Runtime plumbing.
     let mut mmio_bus = MMIOBus::new();
@@ -136,6 +139,29 @@ fn main() {
     let virtio_net = Arc::new(Mutex::new(virtio_net));
     mmio_bus
         .insert_virtio(MMIO_MEM_START, virtio_net.clone(), guest_mem.clone())
+        .unwrap();
+
+    let virtio_blk = Blk::new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(BLOCK_PATH)
+            .expect("failed to open block path"),
+    )
+    .expect("failed to create virtio blk");
+    vm.register_irqfd(virtio_blk.interrupt_event(), 6).unwrap();
+    for (q_sel, evt) in virtio_blk.queues_events().iter().enumerate() {
+        let addr = IoEventAddress::Mmio(QUEUE_NOTIFY_OFFSET + BLK_MMIO_MEM_START);
+        vm.register_ioevent(evt, &addr, q_sel as u32).unwrap();
+    }
+    let virtio_blk_queue_events = virtio_blk
+        .queues_events()
+        .iter()
+        .map(|evt| evt.try_clone().unwrap())
+        .collect::<Vec<_>>();
+    let virtio_blk = Arc::new(Mutex::new(virtio_blk));
+    mmio_bus
+        .insert_virtio(BLK_MMIO_MEM_START, virtio_blk.clone(), guest_mem.clone())
         .unwrap();
 
     let com_evt_1 = EventWrapper::new();
@@ -161,6 +187,9 @@ fn main() {
     poll.add(&virtio_net_activate_evt, 2).unwrap();
     for (q_sel, evt) in virtio_net_queue_events.iter().enumerate() {
         poll.add(evt, 3 + q_sel as u8).unwrap();
+    }
+    for (q_sel, evt) in virtio_blk_queue_events.iter().enumerate() {
+        poll.add(evt, BLK_QUEUE_TOKEN + q_sel as u8).unwrap();
     }
 
     let mut tap_rx_registered = false;
@@ -213,6 +242,14 @@ fn main() {
                     let _ = virtio_net_queue_events[idx].read().unwrap();
                     let mut net = virtio_net.lock().unwrap();
                     let _ = net.process_tx();
+                }
+                token if token >= BLK_QUEUE_TOKEN
+                    && token < BLK_QUEUE_TOKEN + virtio_blk_queue_events.len() as u8 =>
+                {
+                    let idx = (token - BLK_QUEUE_TOKEN) as usize;
+                    let _ = virtio_blk_queue_events[idx].read().unwrap();
+                    let mut blk = virtio_blk.lock().unwrap();
+                    let _ = blk.process_queue();
                 }
                 _ => unreachable!(),
             }
@@ -438,38 +475,13 @@ fn load_kernel(guest_mem: &GuestMemoryMmap<()>) -> GuestAddress {
     .kernel_load
 }
 
-fn load_initrd(guest_mem: &GuestMemoryMmap<()>) -> (GuestAddress, usize) {
-    let initrd_content = std::fs::read(INITRD_PATH).expect("failed to read initrd");
-    let first_region = guest_mem.find_region(GuestAddress::new(0)).unwrap();
-    assert!(
-        initrd_content.len() <= first_region.size(),
-        "too big initrd"
-    );
-
-    let initrd_addr =
-        GuestAddress((first_region.size() - initrd_content.len()) as u64 & !(4096 - 1));
-    guest_mem
-        .read_volatile_from(
-            initrd_addr,
-            &mut Cursor::new(&initrd_content),
-            initrd_content.len(),
-        )
-        .unwrap();
-
-    (initrd_addr, initrd_content.len())
-}
-
 fn load_boot_cmdline(guest_mem: &GuestMemoryMmap<()>) {
     let mut boot_cmdline = Cmdline::new(0x10000).unwrap();
     boot_cmdline.insert_str(BOOT_CMD).unwrap();
     load_cmdline(guest_mem, GuestAddress(BOOT_CMD_START), &boot_cmdline).unwrap();
 }
 
-fn write_boot_params(
-    guest_mem: &GuestMemoryMmap<()>,
-    initrd_addr: GuestAddress,
-    initrd_size: usize,
-) {
+fn write_boot_params(guest_mem: &GuestMemoryMmap<()>) {
     let mut params = boot_params::default();
 
     params.hdr.type_of_loader = KERNEL_TYPE_OF_LOADER;
@@ -478,8 +490,6 @@ fn write_boot_params(
     params.hdr.cmd_line_ptr = BOOT_CMD_START as u32;
     params.hdr.cmdline_size = 1 + BOOT_CMD.len() as u32;
     params.hdr.kernel_alignment = KERNEL_MIN_ALIGNMENT_BYTES;
-    params.hdr.ramdisk_image = initrd_addr.raw_value() as u32;
-    params.hdr.ramdisk_size = initrd_size as u32;
 
     add_e820_entry(&mut params, 0, EBDA_START, E820_RAM);
     let last_addr = guest_mem.last_addr();
