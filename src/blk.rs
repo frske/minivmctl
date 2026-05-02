@@ -1,6 +1,6 @@
 use std::{
-    fs::File,
     fmt,
+    fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
     ops::Deref,
     sync::{
@@ -9,8 +9,8 @@ use std::{
     },
 };
 
-use vm_superio::Trigger;
 use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
+use vm_superio::Trigger;
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
 use crate::virtio::{DescriptorChain, Queue, VirtioDevice};
@@ -414,13 +414,8 @@ impl Blk {
             };
 
             let result = self.execute_request(&mem, &request);
-            let complete_result = Self::complete_request(
-                &mem,
-                &mut self.queues[0],
-                desc_index,
-                &request,
-                result,
-            );
+            let complete_result =
+                Self::complete_request(&mem, &mut self.queues[0], desc_index, &request, result);
             if complete_result.is_ok() {
                 try_notify = true;
             }
@@ -446,11 +441,7 @@ impl Blk {
         Ok(())
     }
 
-    fn execute_request<M>(
-        &mut self,
-        mem: &M,
-        request: &Request,
-    ) -> Result<u32, ExecuteError>
+    fn execute_request<M>(&mut self, mem: &M, request: &Request) -> Result<u32, ExecuteError>
     where
         M: GuestMemoryBackend,
     {
@@ -483,10 +474,16 @@ impl Blk {
                 self.disk_image
                     .seek(SeekFrom::Start(offset))
                     .map_err(ExecuteError::Seek)?;
-                copy_from_guest(mem, request.data(), &mut self.disk_image).map_err(|_| ExecuteError::Write(io::Error::other("failed to write disk image")))?;
+                copy_from_guest(mem, request.data(), &mut self.disk_image).map_err(|_| {
+                    ExecuteError::Write(io::Error::other("failed to write disk image"))
+                })?;
                 Ok(0)
             }
-            RequestType::Flush => self.disk_image.sync_all().map(|_| 0).map_err(ExecuteError::Flush),
+            RequestType::Flush => self
+                .disk_image
+                .sync_all()
+                .map(|_| 0)
+                .map_err(ExecuteError::Flush),
             RequestType::Unsupported(value) => Err(ExecuteError::Unsupported(value)),
         }
     }

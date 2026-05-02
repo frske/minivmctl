@@ -119,7 +119,10 @@ impl MMIOTransport {
                 self.device_status = status;
                 let mut locked_device = self.device.lock().unwrap();
                 if !locked_device.is_activated()
-                    && locked_device.queues().iter().all(|q: &Queue| q.is_valid(&self.mem))
+                    && locked_device
+                        .queues()
+                        .iter()
+                        .all(|q: &Queue| q.is_valid(&self.mem))
                     && locked_device.activate(self.mem.clone()).is_err()
                 {
                     self.device_status |= DEVICE_NEEDS_RESET;
@@ -263,11 +266,14 @@ mod tests {
     use super::*;
     use std::{
         io,
-        sync::{atomic::{AtomicUsize, Ordering}, Arc},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
     use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
-    use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
     use vm_superio::Trigger;
+    use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -318,7 +324,9 @@ mod tests {
                     .map(|_| EventFd::new(EFD_NONBLOCK).unwrap())
                     .collect(),
                 irq_status: Arc::new(AtomicU32::new(0)),
-                trigger: CountingTrigger { calls: Arc::new(AtomicUsize::new(0)) },
+                trigger: CountingTrigger {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                },
                 config: vec![1, 2, 3, 4, 5, 6, 7, 8],
                 activated: false,
                 activate_calls: 0,
@@ -329,15 +337,33 @@ mod tests {
     }
 
     impl VirtioDevice for FakeDevice {
-        fn avail_features(&self) -> u64 { self.avail_features }
-        fn acked_features(&self) -> u64 { self.acked_features }
-        fn set_acked_features(&mut self, acked_features: u64) { self.acked_features = acked_features; }
-        fn device_type(&self) -> u32 { 0xfeed }
-        fn queues(&self) -> &[Queue] { self.queues.as_slice() }
-        fn queues_mut(&mut self) -> &mut [Queue] { self.queues.as_mut_slice() }
-        fn queues_events(&self) -> &[EventFd] { self.events.as_slice() }
-        fn interrupt_trigger(&self) -> &dyn Trigger<E = io::Error> { &self.trigger }
-        fn interrupt_status(&self) -> Arc<AtomicU32> { Arc::clone(&self.irq_status) }
+        fn avail_features(&self) -> u64 {
+            self.avail_features
+        }
+        fn acked_features(&self) -> u64 {
+            self.acked_features
+        }
+        fn set_acked_features(&mut self, acked_features: u64) {
+            self.acked_features = acked_features;
+        }
+        fn device_type(&self) -> u32 {
+            0xfeed
+        }
+        fn queues(&self) -> &[Queue] {
+            self.queues.as_slice()
+        }
+        fn queues_mut(&mut self) -> &mut [Queue] {
+            self.queues.as_mut_slice()
+        }
+        fn queues_events(&self) -> &[EventFd] {
+            self.events.as_slice()
+        }
+        fn interrupt_trigger(&self) -> &dyn Trigger<E = io::Error> {
+            &self.trigger
+        }
+        fn interrupt_status(&self) -> Arc<AtomicU32> {
+            Arc::clone(&self.irq_status)
+        }
         fn read_config(&self, offset: u32, data: &mut [u8]) {
             let start = offset as usize;
             let len = self.config.len().saturating_sub(start).min(data.len());
@@ -349,7 +375,9 @@ mod tests {
             self.activated = true;
             Ok(())
         }
-        fn is_activated(&self) -> bool { self.activated }
+        fn is_activated(&self) -> bool {
+            self.activated
+        }
         fn reset(&mut self) -> Option<(EventFd, Vec<EventFd>)> {
             self.reset_calls += 1;
             if !self.reset_ok {
@@ -376,19 +404,27 @@ mod tests {
         queue.used_ring = GuestAddress(0x3000);
 
         mem.write_obj(
-            Descriptor { addr: 0x4000, len: 8, flags: 0, next: 0 },
+            Descriptor {
+                addr: 0x4000,
+                len: 8,
+                flags: 0,
+                next: 0,
+            },
             queue.desc_table,
         )
         .unwrap();
         mem.write_obj(0u16, queue.avail_ring).unwrap();
-        mem.write_obj(1u16, queue.avail_ring.unchecked_add(2)).unwrap();
-        mem.write_obj(0u16, queue.avail_ring.unchecked_add(4)).unwrap();
+        mem.write_obj(1u16, queue.avail_ring.unchecked_add(2))
+            .unwrap();
+        mem.write_obj(0u16, queue.avail_ring.unchecked_add(4))
+            .unwrap();
     }
 
     // Basic MMIO registers read back right values.
     #[test]
     fn mmio_reports_basic_registers_and_features() {
-        let (_device, mut transport) = transport_with_device(FakeDevice::new((1u64 << 40) | 0x12, 1, true));
+        let (_device, mut transport) =
+            transport_with_device(FakeDevice::new((1u64 << 40) | 0x12, 1, true));
         let mut data = [0u8; 4];
 
         transport.bus_read(0x0, &mut data);
@@ -412,7 +448,8 @@ mod tests {
     // Unsupported feature bits are masked out per page.
     #[test]
     fn mmio_ack_features_masks_unsupported_bits() {
-        let (device, mut transport) = transport_with_device(FakeDevice::new((1u64 << 40) | 0x12, 1, true));
+        let (device, mut transport) =
+            transport_with_device(FakeDevice::new((1u64 << 40) | 0x12, 1, true));
 
         transport.bus_write(0x70, &1u32.to_le_bytes());
         transport.bus_write(0x70, &3u32.to_le_bytes());

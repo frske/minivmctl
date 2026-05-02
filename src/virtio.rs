@@ -71,7 +71,13 @@ where
     {
         const VIRTQ_DESC_F_NEXT: u16 = 0x1;
         if self.flags & VIRTQ_DESC_F_NEXT != 0 {
-            Self::new(self.mem.clone(), self.desc_table, self.queue_size, self.next).ok()
+            Self::new(
+                self.mem.clone(),
+                self.desc_table,
+                self.queue_size,
+                self.next,
+            )
+            .ok()
         } else {
             None
         }
@@ -387,13 +393,23 @@ mod tests {
             &mem,
             table,
             0,
-            Descriptor { addr: 0x4000, len: 4, flags: 1, next: 1 },
+            Descriptor {
+                addr: 0x4000,
+                len: 4,
+                flags: 1,
+                next: 1,
+            },
         );
         write_descriptor(
             &mem,
             table,
             1,
-            Descriptor { addr: 0x5000, len: 4, flags: 0, next: 0 },
+            Descriptor {
+                addr: 0x5000,
+                len: 4,
+                flags: 0,
+                next: 0,
+            },
         );
 
         let chain = DescriptorChain::new(&mem, table, 2, 0).unwrap();
@@ -413,7 +429,12 @@ mod tests {
             &mem,
             table,
             0,
-            Descriptor { addr: 0x4000, len: 4, flags: 0, next: 1 },
+            Descriptor {
+                addr: 0x4000,
+                len: 4,
+                flags: 0,
+                next: 1,
+            },
         );
 
         let chain = DescriptorChain::new(&mem, table, 2, 0).unwrap();
@@ -431,13 +452,23 @@ mod tests {
             &mem,
             table,
             0,
-            Descriptor { addr: 0x4000, len: 4, flags: 1, next: 1 },
+            Descriptor {
+                addr: 0x4000,
+                len: 4,
+                flags: 1,
+                next: 1,
+            },
         );
         write_descriptor(
             &mem,
             table,
             1,
-            Descriptor { addr: 0x5000, len: 4, flags: 0, next: 0 },
+            Descriptor {
+                addr: 0x5000,
+                len: 4,
+                flags: 0,
+                next: 0,
+            },
         );
 
         let chain = DescriptorChain::new(&mem, table, 2, 0).unwrap();
@@ -460,7 +491,12 @@ mod tests {
             &mem,
             table,
             0,
-            Descriptor { addr: 0x4000, len: 4, flags: 0, next: 0 },
+            Descriptor {
+                addr: 0x4000,
+                len: 4,
+                flags: 0,
+                next: 0,
+            },
         );
 
         let chain = DescriptorChain::new(&mem, table, 1, 0).unwrap();
@@ -518,7 +554,12 @@ mod tests {
             &mem,
             queue.desc_table,
             0,
-            Descriptor { addr: 0x4000, len: 8, flags: 0, next: 0 },
+            Descriptor {
+                addr: 0x4000,
+                len: 8,
+                flags: 0,
+                next: 0,
+            },
         );
         write_u16(&mem, queue.avail_ring, 0);
         write_u16(&mem, queue.avail_ring.unchecked_add(2), 1);
@@ -570,8 +611,10 @@ mod tests {
 
         let mut id = [0u8; 4];
         let mut len = [0u8; 4];
-        mem.read_slice(&mut id, queue.used_ring.unchecked_add(4)).unwrap();
-        mem.read_slice(&mut len, queue.used_ring.unchecked_add(8)).unwrap();
+        mem.read_slice(&mut id, queue.used_ring.unchecked_add(4))
+            .unwrap();
+        mem.read_slice(&mut len, queue.used_ring.unchecked_add(8))
+            .unwrap();
 
         assert_eq!(u32::from_le_bytes(id), 7);
         assert_eq!(u32::from_le_bytes(len), 11);

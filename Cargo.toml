@@ -4,10 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ini = { package = "rust-ini", version = "0.21.3" }
 kvm-bindings = "0.14.0"
 kvm-ioctls = "0.24.0"
 libc = "0.2.186"
 linux-loader = {git = "https://github.com/frske/linux-loader.git", branch = "topic/vm-memory-0.18"  }
+netdev = "0.34.0"
+iptables = "0.5.0"
+nix = { version = "0.29.0", features = ["mount", "user"] }
 slab = "0.4.12"
 vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
 vm-superio = "0.8.1"

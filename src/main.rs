@@ -1,6 +1,8 @@
 use std::{
     collections::VecDeque,
+    fs,
     fs::OpenOptions,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -13,11 +15,11 @@ use vmm_sys_util::{
 };
 
 use scratch_new::{
-    boot::{self, BootArtifacts},
     blk::Blk,
+    boot::{self, BootArtifacts},
     bus::MMIOBus,
     event::EventWrapper,
-    net,
+    net, provision,
     serial::DummySerialEvent,
     virtio::VirtioDevice,
 };
@@ -28,8 +30,9 @@ const BLK_MMIO_MEM_START: u64 = MMIO_MEM_START + 0x1000;
 
 const COM1: u16 = 0x3f8;
 const MMIO_MEM_START: u64 = 0xd0000000;
-const BLOCK_PATH: &str = "/home/frsk/prj/kernel_images/rootfs.ext4";
 const KERNEL_PATH: &str = "/home/frsk/prj/kernel_images/linux-6.6.99/vmlinux";
+const SSH_KEY_PATH: &str = "/home/frsk/.ssh/id_ed25519.pub";
+const VM_ID: u8 = 0;
 const QUEUE_NOTIFY_OFFSET: u64 = 0x50;
 const GUEST_MAC: [u8; 6] = [0x02, 0x12, 0x34, 0x56, 0x78, 0x9a];
 
@@ -38,6 +41,14 @@ const TAP_RX_TOKEN: u8 = 3 + NET_NUM_QUEUES as u8;
 const BLK_QUEUE_TOKEN: u8 = TAP_RX_TOKEN + 1;
 
 fn main() {
+    let _provision_guard = ProvisionGuard { id: VM_ID };
+    provision::provision_host(VM_ID).expect("failed to provision host");
+    let public_ssh_key = fs::read_to_string(SSH_KEY_PATH).expect("failed to read SSH key");
+    provision::provision_guest(VM_ID, public_ssh_key.trim_end())
+        .expect("failed to provision guest");
+    let block_path: PathBuf = provision::vm_rootfs_path(VM_ID);
+    let tap_name = format!("tap{}", VM_ID);
+
     let BootArtifacts {
         vm,
         vcpu,
@@ -46,7 +57,8 @@ fn main() {
 
     let mut mmio_bus = MMIOBus::new();
 
-    let virtio_net = net::Net::new("tap0", Some(GUEST_MAC)).expect("failed to create virtio net");
+    let virtio_net =
+        net::Net::new(&tap_name, Some(GUEST_MAC)).expect("failed to create virtio net");
     vm.register_irqfd(virtio_net.interrupt_event(), 5).unwrap();
     for (q_sel, evt) in virtio_net.queues_events().iter().enumerate() {
         let addr = IoEventAddress::Mmio(QUEUE_NOTIFY_OFFSET + MMIO_MEM_START);
@@ -68,7 +80,7 @@ fn main() {
         OpenOptions::new()
             .read(true)
             .write(true)
-            .open(BLOCK_PATH)
+            .open(&block_path)
             .expect("failed to open block path"),
     )
     .expect("failed to create virtio blk");
@@ -97,7 +109,12 @@ fn main() {
     )));
 
     let exit_evt = EventWrapper::new();
-    spawn_vcpu_runtime(vcpu, stdio_serial.clone(), mmio_bus, exit_evt.try_clone().unwrap());
+    spawn_vcpu_runtime(
+        vcpu,
+        stdio_serial.clone(),
+        mmio_bus,
+        exit_evt.try_clone().unwrap(),
+    );
 
     let stdin = std::io::stdin().lock();
     stdin.set_raw_mode().expect("failed to set raw mode");
@@ -164,8 +181,9 @@ fn main() {
                     let mut net = virtio_net.lock().unwrap();
                     let _ = net.process_tx();
                 }
-                token if token >= BLK_QUEUE_TOKEN
-                    && token < BLK_QUEUE_TOKEN + virtio_blk_queue_events.len() as u8 =>
+                token
+                    if token >= BLK_QUEUE_TOKEN
+                        && token < BLK_QUEUE_TOKEN + virtio_blk_queue_events.len() as u8 =>
                 {
                     let idx = (token - BLK_QUEUE_TOKEN) as usize;
                     let _ = virtio_blk_queue_events[idx].read().unwrap();
@@ -175,6 +193,17 @@ fn main() {
                 _ => unreachable!(),
             }
         }
+    }
+}
+
+struct ProvisionGuard {
+    id: u8,
+}
+
+impl Drop for ProvisionGuard {
+    fn drop(&mut self) {
+        let _ = provision::deprovision_guest(self.id);
+        let _ = provision::deprovision_host(self.id);
     }
 }
 
@@ -195,7 +224,8 @@ fn spawn_vcpu_runtime(
                     }
                     VcpuExit::IoOut(addr, data) => {
                         if addr >= COM1 && addr - COM1 < 8 {
-                            let _ = lock_host_serial(&stdio_serial).write((addr - COM1) as u8, data[0]);
+                            let _ =
+                                lock_host_serial(&stdio_serial).write((addr - COM1) as u8, data[0]);
                         }
                     }
                     VcpuExit::MmioRead(addr, data) => {
@@ -226,9 +256,7 @@ fn spawn_vcpu_runtime(
     });
 }
 
-fn lock_host_serial(
-    serial: &Arc<Mutex<HostSerial>>,
-) -> std::sync::MutexGuard<'_, HostSerial> {
+fn lock_host_serial(serial: &Arc<Mutex<HostSerial>>) -> std::sync::MutexGuard<'_, HostSerial> {
     match serial.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),

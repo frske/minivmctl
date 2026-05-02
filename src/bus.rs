@@ -1,6 +1,6 @@
 use std::{
-    ops::Sub,
     ops::Range,
+    ops::Sub,
     sync::{Arc, Mutex},
 };
 
@@ -31,7 +31,9 @@ where
     A: PartialOrd<A>,
 {
     pub fn new() -> Self {
-        Self { devices: Vec::new() }
+        Self {
+            devices: Vec::new(),
+        }
     }
 
     pub fn insert(&mut self, range: Range<A>, device: Arc<Mutex<D>>) -> Result<(), BusError> {

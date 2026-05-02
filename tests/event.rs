@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use scratch_new::event::{EventHandlerMut, EventLoop, EventWrapper};
-use vmm_sys_util::epoll::EventSet;
 use vm_superio::Trigger;
+use vmm_sys_util::epoll::EventSet;
 
 struct Recorder {
     seen: Arc<Mutex<Vec<EventSet>>>,
@@ -42,11 +42,9 @@ fn event_loop_dispatches_registered_callback() {
     let evt = EventWrapper::new();
     let seen = Arc::new(Mutex::new(Vec::new()));
 
-    loop_.register(
-        &evt.0,
-        EventSet::IN,
-        Recorder { seen: seen.clone() },
-    ).unwrap();
+    loop_
+        .register(&evt.0, EventSet::IN, Recorder { seen: seen.clone() })
+        .unwrap();
 
     evt.trigger().unwrap();
     loop_.tick(0).unwrap();

@@ -5,16 +5,16 @@ use std::{
     ops::Deref,
     os::fd::{AsRawFd, FromRawFd},
     sync::{
-        atomic::{AtomicU32, Ordering},
         Arc,
+        atomic::{AtomicU32, Ordering},
     },
 };
 
 use crate::virtio::{DescriptorChain, Queue, VirtioDevice};
-use libc::{ifreq, IFNAMSIZ, TUN_F_CSUM};
+use libc::{IFNAMSIZ, TUN_F_CSUM, ifreq};
 use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 use vm_superio::Trigger;
-use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
+use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 use vmm_sys_util::poll::PollContext;
 
 const TUN_F_TSO4: libc::c_uint = 0x02;
@@ -466,7 +466,8 @@ where
             let desc_index = desc.index;
             match self.tap.readv(desc.clone()) {
                 Ok(n) => {
-                    if let Err(_e) = desc.write_at(VNET_HDR_NUM_BUFFERS_OFFSET, &u16::to_le_bytes(1))
+                    if let Err(_e) =
+                        desc.write_at(VNET_HDR_NUM_BUFFERS_OFFSET, &u16::to_le_bytes(1))
                     {
                         println!("failed to write vnet header num buffers");
                     }
@@ -618,7 +619,11 @@ impl Tap {
 mod tests {
     use super::*;
     use crate::virtio::VirtioDevice;
-    use std::{collections::VecDeque, io, sync::{Arc, Mutex, atomic::Ordering}};
+    use std::{
+        collections::VecDeque,
+        io,
+        sync::{Arc, Mutex, atomic::Ordering},
+    };
     use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
 
     #[repr(C)]
@@ -696,12 +701,18 @@ mod tests {
 
         fn readv<B: IntoIoVec>(&mut self, _data: B) -> io::Result<usize> {
             self.read_calls += 1;
-            self.reads.pop_front().unwrap_or(Action::Ok(0)).into_result()
+            self.reads
+                .pop_front()
+                .unwrap_or(Action::Ok(0))
+                .into_result()
         }
 
         fn writev<B: IntoIoVec>(&mut self, _data: B) -> io::Result<usize> {
             self.write_calls += 1;
-            self.writes.pop_front().unwrap_or(Action::Ok(0)).into_result()
+            self.writes
+                .pop_front()
+                .unwrap_or(Action::Ok(0))
+                .into_result()
         }
     }
 
@@ -719,8 +730,14 @@ mod tests {
         }
     }
 
-    fn write_descriptor(mem: &GuestMemoryMmap<()>, table: GuestAddress, index: u16, desc: Descriptor) {
-        mem.write_obj(desc, table.unchecked_add(u64::from(index) * 16)).unwrap();
+    fn write_descriptor(
+        mem: &GuestMemoryMmap<()>,
+        table: GuestAddress,
+        index: u16,
+        desc: Descriptor,
+    ) {
+        mem.write_obj(desc, table.unchecked_add(u64::from(index) * 16))
+            .unwrap();
     }
 
     fn setup_queue(mem: &GuestMemoryMmap<()>, queue: &mut Queue, flags: u16) {
@@ -730,10 +747,22 @@ mod tests {
         queue.avail_ring = GuestAddress(0x2000);
         queue.used_ring = GuestAddress(0x3000);
 
-        write_descriptor(mem, queue.desc_table, 0, Descriptor { addr: 0x4000, len: 64, flags, next: 0 });
+        write_descriptor(
+            mem,
+            queue.desc_table,
+            0,
+            Descriptor {
+                addr: 0x4000,
+                len: 64,
+                flags,
+                next: 0,
+            },
+        );
         mem.write_obj(0u16, queue.avail_ring).unwrap();
-        mem.write_obj(1u16, queue.avail_ring.unchecked_add(2)).unwrap();
-        mem.write_obj(0u16, queue.avail_ring.unchecked_add(4)).unwrap();
+        mem.write_obj(1u16, queue.avail_ring.unchecked_add(2))
+            .unwrap();
+        mem.write_obj(0u16, queue.avail_ring.unchecked_add(4))
+            .unwrap();
     }
 
     fn setup_net(tap: SharedTap) -> (Net<SharedTap>, SharedTap, GuestMemoryMmap<()>) {
@@ -895,7 +924,17 @@ mod tests {
         let mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10_000)]).unwrap();
         let table = GuestAddress(0x1000);
 
-        write_descriptor(&mem, table, 0, Descriptor { addr: 0x4000, len: 4, flags: 0, next: 0 });
+        write_descriptor(
+            &mem,
+            table,
+            0,
+            Descriptor {
+                addr: 0x4000,
+                len: 4,
+                flags: 0,
+                next: 0,
+            },
+        );
 
         let chain = DescriptorChain::new(&mem, table, 2, 0).unwrap();
         let mut buf = Vec::new();
@@ -903,7 +942,17 @@ mod tests {
         let iov = chain.into_iovec(&mut buf, false).unwrap();
         assert_eq!(iov.len(), 1);
 
-        write_descriptor(&mem, table, 0, Descriptor { addr: 0x5000, len: 4, flags: 2, next: 0 });
+        write_descriptor(
+            &mem,
+            table,
+            0,
+            Descriptor {
+                addr: 0x5000,
+                len: 4,
+                flags: 2,
+                next: 0,
+            },
+        );
         let chain = DescriptorChain::new(&mem, table, 2, 0).unwrap();
         let iov = chain.into_iovec(&mut buf, true).unwrap();
         assert_eq!(iov.len(), 1);
@@ -915,7 +964,17 @@ mod tests {
         let mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10_000)]).unwrap();
         let table = GuestAddress(0x1000);
 
-        write_descriptor(&mem, table, 0, Descriptor { addr: 0x4000, len: 4, flags: 2, next: 0 });
+        write_descriptor(
+            &mem,
+            table,
+            0,
+            Descriptor {
+                addr: 0x4000,
+                len: 4,
+                flags: 2,
+                next: 0,
+            },
+        );
 
         let chain = DescriptorChain::new(&mem, table, 1, 0).unwrap();
         let mut buf = Vec::new();

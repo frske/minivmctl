@@ -1,8 +1,9 @@
-pub mod boot;
 pub mod blk;
+pub mod boot;
 pub mod bus;
 pub mod event;
 pub mod mmio;
 pub mod net;
+pub mod provision;
 pub mod serial;
 pub mod virtio;

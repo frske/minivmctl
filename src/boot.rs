@@ -32,8 +32,7 @@ pub const FIRST_ADDR_PAST_32BITS: u64 = 1 << 32;
 pub const MEM_32BIT_GAP_SIZE: u64 = 768 << 20;
 pub const MMIO_MEM_START: u64 = FIRST_ADDR_PAST_32BITS - MEM_32BIT_GAP_SIZE;
 
-pub const BOOT_CMD: &str =
-    "console=ttyS0 noapic noacpi reboot=k panic=1 pci=off net.ifnames=0 biosdevname=0 root=/dev/vda rootwait rw virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0001000:6";
+pub const BOOT_CMD: &str = "console=ttyS0 noapic noacpi reboot=k panic=1 pci=off net.ifnames=0 biosdevname=0 root=/dev/vda rootwait rw virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0001000:6";
 pub const HIMEM_START: u64 = 0x100000;
 pub const BOOT_CMD_START: u64 = 0x20000;
 pub const ZERO_PAGE_START: u64 = 0x7000;
