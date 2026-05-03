@@ -1,18 +1,13 @@
 use std::{
-    collections::VecDeque,
     fs,
     fs::OpenOptions,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
 use kvm_ioctls::{IoEventAddress, VcpuExit};
 use vm_superio::{Serial, Trigger};
-use vmm_sys_util::{
-    poll::{PollContext, PollEvents},
-    terminal::Terminal,
-};
+use vmm_sys_util::poll::{PollContext, PollEvents};
 
 use scratch_new::{
     blk::Blk,
@@ -24,7 +19,7 @@ use scratch_new::{
     virtio::VirtioDevice,
 };
 
-type HostSerial = Serial<EventWrapper, DummySerialEvent, std::io::Stdout>;
+type HostSerial = Serial<EventWrapper, DummySerialEvent, std::io::Sink>;
 
 const BLK_MMIO_MEM_START: u64 = MMIO_MEM_START + 0x1000;
 
@@ -114,7 +109,7 @@ fn main() {
     let stdio_serial = Arc::new(Mutex::new(Serial::with_events(
         com_evt_1.try_clone().unwrap(),
         DummySerialEvent,
-        std::io::stdout(),
+        std::io::sink(),
     )));
 
     let exit_evt = EventWrapper::new();
@@ -125,12 +120,8 @@ fn main() {
         exit_evt.try_clone().unwrap(),
     );
 
-    let stdin = std::io::stdin().lock();
-    stdin.set_raw_mode().expect("failed to set raw mode");
-
     let poll: PollContext<u8> = PollContext::new().unwrap();
     poll.add(&exit_evt.0, 0).unwrap();
-    poll.add(&stdin, 1).unwrap();
     poll.add(&virtio_net_activate_evt, 2).unwrap();
     for (q_sel, evt) in virtio_net_queue_events.iter().enumerate() {
         poll.add(evt, 3 + q_sel as u8).unwrap();
@@ -140,34 +131,14 @@ fn main() {
     }
 
     let mut tap_rx_registered = false;
-    let mut pending_stdin = VecDeque::new();
 
     'l: loop {
-        flush_pending_stdin(&stdio_serial, &mut pending_stdin);
-
-        let events: PollEvents<u8> = if pending_stdin.is_empty() {
-            poll.wait().unwrap()
-        } else {
-            poll.wait_timeout(Duration::from_millis(10)).unwrap()
-        };
+        let events: PollEvents<u8> = poll.wait().unwrap();
         for event in events.iter_readable() {
             match event.token() {
                 0 => {
                     println!("vcpu stopped, main loop exit");
                     break 'l;
-                }
-                1 => {
-                    let mut out = [0u8; 64];
-                    match stdin.read_raw(&mut out[..]) {
-                        Ok(0) => {}
-                        Ok(count) => {
-                            pending_stdin.extend(&out[..count]);
-                            flush_pending_stdin(&stdio_serial, &mut pending_stdin);
-                        }
-                        Err(e) => {
-                            eprintln!("error while reading stdin: {:?}", e);
-                        }
-                    }
                 }
                 2 => {
                     let _ = virtio_net_activate_evt.read().unwrap();
@@ -269,32 +240,5 @@ fn lock_host_serial(serial: &Arc<Mutex<HostSerial>>) -> std::sync::MutexGuard<'_
     match serial.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-fn flush_pending_stdin(serial: &Arc<Mutex<HostSerial>>, pending: &mut VecDeque<u8>) {
-    loop {
-        if pending.is_empty() {
-            break;
-        }
-
-        let written = {
-            let contiguous = pending.make_contiguous();
-            let mut serial = lock_host_serial(serial);
-            match serial.enqueue_raw_bytes(contiguous) {
-                Ok(written) => written,
-                Err(vm_superio::serial::Error::FullFifo) => break,
-                Err(e) => {
-                    println!("failed to enqueue bytes: {:?}", e);
-                    break;
-                }
-            }
-        };
-
-        if written == 0 {
-            break;
-        }
-
-        pending.drain(..written);
     }
 }
