@@ -20,18 +20,25 @@ pub fn vm_rootfs_path(id: u8) -> PathBuf {
     vm_rootfs_dir(id).join("rootfs.ext4")
 }
 
-pub fn provision_host(id: u8) -> ProvisionResult<()> {
+pub fn provision_shared_host() -> ProvisionResult<()> {
     if !is_root() {
-        return Err("provision_host requires root".into());
+        return Err("provision_shared_host requires root".into());
     }
 
     let host_interface = default_interface_name()?;
 
     ensure_bridge_exists()?;
-    configure_tap_interface(id)?;
     configure_iptables(&host_interface)?;
 
     Ok(())
+}
+
+pub fn provision_vm_host(id: u8) -> ProvisionResult<()> {
+    if !is_root() {
+        return Err("provision_vm_host requires root".into());
+    }
+
+    configure_tap_interface(id)
 }
 
 pub fn provision_guest(id: u8, public_ssh_key: &str) -> ProvisionResult<()> {
@@ -62,9 +69,9 @@ pub fn deprovision_guest(id: u8) -> ProvisionResult<()> {
     Ok(())
 }
 
-pub fn deprovision_host(id: u8) -> ProvisionResult<()> {
+pub fn deprovision_vm_host(id: u8) -> ProvisionResult<()> {
     if !is_root() {
-        return Err("deprovision_host requires root".into());
+        return Err("deprovision_vm_host requires root".into());
     }
 
     let tap_name = format!("tap{}", id);
@@ -76,6 +83,19 @@ pub fn deprovision_host(id: u8) -> ProvisionResult<()> {
     if !status.success() {
         return Err(format!("Failed deleting {} interface", &tap_name).into());
     }
+
+    Ok(())
+}
+
+pub fn deprovision_shared_host() -> ProvisionResult<()> {
+    if !is_root() {
+        return Err("deprovision_shared_host requires root".into());
+    }
+
+    let host_interface = default_interface_name()?;
+
+    deconfigure_iptables(&host_interface)?;
+    remove_bridge()?;
 
     Ok(())
 }
@@ -159,34 +179,67 @@ fn configure_tap_interface(id: u8) -> ProvisionResult<()> {
 fn configure_iptables(interface_name: &str) -> ProvisionResult<()> {
     let ipt = iptables::new(false).map_err(|e| e.to_string())?;
 
-    let rule = format!("-s 10.10.0.0/24 -o {} -j MASQUERADE", interface_name);
-    if !ipt
-        .exists("nat", "POSTROUTING", &rule)
-        .map_err(|e| e.to_string())?
-    {
-        ipt.append("nat", "POSTROUTING", &rule)
-            .map_err(|e| e.to_string())?;
+    for (table, chain, rule) in iptables_rules(interface_name) {
+        if !ipt.exists(table, chain, &rule).map_err(|e| e.to_string())? {
+            ipt.append(table, chain, &rule).map_err(|e| e.to_string())?;
+        }
     }
 
-    let rule = format!("-i br0 -o {} -j ACCEPT", interface_name);
-    if !ipt
-        .exists("filter", "FORWARD", &rule)
-        .map_err(|e| e.to_string())?
-    {
-        ipt.append("filter", "FORWARD", &rule)
-            .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn deconfigure_iptables(interface_name: &str) -> ProvisionResult<()> {
+    let ipt = iptables::new(false).map_err(|e| e.to_string())?;
+
+    for (table, chain, rule) in iptables_rules(interface_name) {
+        if ipt.exists(table, chain, &rule).map_err(|e| e.to_string())? {
+            ipt.delete(table, chain, &rule).map_err(|e| e.to_string())?;
+        }
     }
 
-    let rule = format!(
-        "-i {} -o br0 -m state --state RELATED,ESTABLISHED -j ACCEPT",
-        interface_name
-    );
-    if !ipt
-        .exists("filter", "FORWARD", &rule)
-        .map_err(|e| e.to_string())?
-    {
-        ipt.append("filter", "FORWARD", &rule)
-            .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn iptables_rules(interface_name: &str) -> [(&'static str, &'static str, String); 3] {
+    [
+        (
+            "nat",
+            "POSTROUTING",
+            format!("-s 10.10.0.0/24 -o {} -j MASQUERADE", interface_name),
+        ),
+        (
+            "filter",
+            "FORWARD",
+            format!("-i br0 -o {} -j ACCEPT", interface_name),
+        ),
+        (
+            "filter",
+            "FORWARD",
+            format!(
+                "-i {} -o br0 -m state --state RELATED,ESTABLISHED -j ACCEPT",
+                interface_name
+            ),
+        ),
+    ]
+}
+
+fn remove_bridge() -> ProvisionResult<()> {
+    let bridge_exists = Command::new("ip")
+        .args(["link", "show", "br0"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    if !matches!(bridge_exists, Ok(status) if status.success()) {
+        return Ok(());
+    }
+
+    let status = Command::new("ip")
+        .args(["link", "del", "br0"])
+        .status()?;
+
+    if !status.success() {
+        return Err("failed deleting br0 interface".into());
     }
 
     Ok(())
