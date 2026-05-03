@@ -4,12 +4,20 @@ use std::{
     fs::OpenOptions,
     io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    ptr,
+    sync::{
+        atomic::{AtomicBool, AtomicPtr, Ordering},
+        mpsc, Arc, Mutex, OnceLock,
+    },
+    time::Duration,
 };
 
 use kvm_ioctls::{IoEventAddress, VcpuExit, VmFd};
 use vm_superio::{Serial, Trigger};
-use vmm_sys_util::{eventfd::EventFd, poll::{PollContext, PollEvents}};
+use vmm_sys_util::{
+    eventfd::EventFd,
+    poll::{PollContext, PollEvents},
+};
 
 use crate::{
     blk::Blk,
@@ -27,9 +35,69 @@ pub type VmManagerResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>
 
 const BLK_MMIO_MEM_START: u64 = MMIO_MEM_START + 0x1000;
 const COM1: u16 = 0x3f8;
+const COMMAND_TOKEN: u8 = 0;
 const MMIO_MEM_START: u64 = 0xd0000000;
 const QUEUE_NOTIFY_OFFSET: u64 = 0x50;
 const MAX_VM_ID: u8 = 252;
+const VM_STOP_SIGNAL: libc::c_int = libc::SIGUSR1;
+static STOP_SIGNAL_HANDLER_RESULT: OnceLock<Result<(), i32>> = OnceLock::new();
+
+enum VmCommand {
+    Stop {
+        id: u8,
+        response: mpsc::Sender<VmManagerResult<()>>,
+    },
+}
+
+pub struct VmManagerHandle {
+    command_tx: mpsc::Sender<VmCommand>,
+    command_evt: Arc<EventWrapper>,
+    manager_running: Arc<AtomicBool>,
+}
+
+impl Clone for VmManagerHandle {
+    fn clone(&self) -> Self {
+        Self {
+            command_tx: self.command_tx.clone(),
+            command_evt: Arc::clone(&self.command_evt),
+            manager_running: Arc::clone(&self.manager_running),
+        }
+    }
+}
+
+impl VmManagerHandle {
+    /// Requests a hard stop and returns when the manager accepts the request.
+    /// VM cleanup completes later through the existing vCPU exit event path.
+    pub fn request_stop_vm(&self, id: u8) -> VmManagerResult<()> {
+        if !self.manager_running.load(Ordering::SeqCst) {
+            return Err(
+                io::Error::new(io::ErrorKind::NotConnected, "vm manager is not running").into(),
+            );
+        }
+
+        let (response_tx, response_rx) = mpsc::channel();
+        self.command_tx
+            .send(VmCommand::Stop {
+                id,
+                response: response_tx,
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "vm manager is not running"))?;
+        self.command_evt.as_ref().trigger()?;
+        response_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|err| {
+                let kind = match err {
+                    mpsc::RecvTimeoutError::Timeout => io::ErrorKind::TimedOut,
+                    mpsc::RecvTimeoutError::Disconnected => io::ErrorKind::BrokenPipe,
+                };
+                io::Error::new(kind, "vm manager did not process stop command")
+            })?
+    }
+
+    pub fn stop_vm(&self, id: u8) -> VmManagerResult<()> {
+        self.request_stop_vm(id)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EventKind {
@@ -105,15 +173,32 @@ pub struct VmManager {
     configs: HashMap<u8, VmConfig>,
     instances: HashMap<u8, VmInstance>,
     shared_host_provisioned: bool,
+    command_tx: mpsc::Sender<VmCommand>,
+    command_rx: mpsc::Receiver<VmCommand>,
+    command_evt: Arc<EventWrapper>,
+    manager_running: Arc<AtomicBool>,
 }
 
 impl VmManager {
     pub fn new() -> Self {
+        let (command_tx, command_rx) = mpsc::channel();
         Self {
             configs: HashMap::new(),
             instances: HashMap::new(),
             shared_host_provisioned: false,
+            command_tx,
+            command_rx,
+            command_evt: Arc::new(EventWrapper::new()),
+            manager_running: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn handle(&self) -> VmManagerResult<VmManagerHandle> {
+        Ok(VmManagerHandle {
+            command_tx: self.command_tx.clone(),
+            command_evt: Arc::clone(&self.command_evt),
+            manager_running: Arc::clone(&self.manager_running),
+        })
     }
 
     pub fn add_vm(&mut self, config: VmConfig) -> VmManagerResult<()> {
@@ -130,9 +215,11 @@ impl VmManager {
     }
 
     pub fn run(&mut self) -> VmManagerResult<()> {
+        self.manager_running.store(true, Ordering::SeqCst);
         let result = self.run_inner();
         self.cleanup_instances();
         self.cleanup_shared_host();
+        self.manager_running.store(false, Ordering::SeqCst);
         result
     }
 
@@ -152,13 +239,20 @@ impl VmManager {
 
         let poll: PollContext<u8> = PollContext::new().unwrap();
         let mut routes = HashMap::new();
-        let mut next_token_count = 0usize;
+        let mut next_token_count = 1usize;
 
+        poll.add(&self.command_evt.0, COMMAND_TOKEN)
+            .map_err(|e| io::Error::from_raw_os_error(e.errno()))?;
         self.register_instance_events(&poll, &mut routes, &mut next_token_count)?;
 
         while !self.instances.is_empty() {
             let events: PollEvents<u8> = poll.wait().unwrap();
             for event in events.iter_readable() {
+                if event.token() == COMMAND_TOKEN {
+                    self.handle_commands()?;
+                    continue;
+                }
+
                 let Some(route) = routes.get(&event.token()).copied() else {
                     continue;
                 };
@@ -171,6 +265,28 @@ impl VmManager {
         }
 
         Ok(())
+    }
+
+    fn handle_commands(&mut self) -> VmManagerResult<()> {
+        let _ = self.command_evt.read();
+
+        while let Ok(command) = self.command_rx.try_recv() {
+            match command {
+                VmCommand::Stop { id, response } => {
+                    let _ = response.send(self.request_stop_vm(id));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn request_stop_vm(&mut self, id: u8) -> VmManagerResult<()> {
+        let instance = self.instances.get(&id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("vm {id} is not running"))
+        })?;
+
+        instance.request_stop()
     }
 
     fn start_configured_vms(&mut self) -> VmManagerResult<()> {
@@ -257,6 +373,7 @@ impl Drop for VmManager {
 struct VmInstance {
     id: u8,
     _vm: VmFd,
+    vcpu_stopper: VcpuStopper,
     virtio_net_activate_evt: EventFd,
     virtio_net_queue_events: Vec<EventFd>,
     virtio_net: Arc<Mutex<Net>>,
@@ -268,8 +385,11 @@ struct VmInstance {
 
 impl VmInstance {
     fn start(config: VmConfig) -> VmManagerResult<Self> {
+        install_stop_signal_handler()?;
+
         provision::provision_vm_host(config.id()).expect("failed to provision host");
-        let public_ssh_key = fs::read_to_string(&config.ssh_key_path).expect("failed to read SSH key");
+        let public_ssh_key =
+            fs::read_to_string(&config.ssh_key_path).expect("failed to read SSH key");
         provision::provision_guest(config.id(), public_ssh_key.trim_end())
             .expect("failed to provision guest");
 
@@ -341,16 +461,19 @@ impl VmInstance {
         )));
 
         let exit_evt = EventWrapper::new();
+        let vcpu_stopper = VcpuStopper::new();
         spawn_vcpu_runtime(
             vcpu,
             stdio_serial,
             mmio_bus,
             exit_evt.try_clone().unwrap(),
+            vcpu_stopper.clone(),
         );
 
         Ok(Self {
             id: config.id(),
             _vm: vm,
+            vcpu_stopper,
             virtio_net_activate_evt,
             virtio_net_queue_events,
             virtio_net,
@@ -359,6 +482,11 @@ impl VmInstance {
             exit_evt,
             tap_rx_registered: false,
         })
+    }
+
+    fn request_stop(&self) -> VmManagerResult<()> {
+        self.vcpu_stopper.request_stop()?;
+        Ok(())
     }
 
     fn register_base_events(
@@ -475,9 +603,18 @@ fn spawn_vcpu_runtime(
     stdio_serial: Arc<Mutex<HostSerial>>,
     mut mmio_bus: MMIOBus,
     vcpu_exit_evt: EventWrapper,
+    vcpu_stopper: VcpuStopper,
 ) {
     std::thread::spawn(move || {
+        unblock_stop_signal();
+        vcpu_stopper.set_thread();
+        vcpu_stopper.set_kvm_run(vcpu.get_kvm_run() as *mut _);
+
         loop {
+            if vcpu_stopper.stop_requested() {
+                break;
+            }
+
             match vcpu.run() {
                 Ok(run) => match run {
                     VcpuExit::IoIn(addr, data) => {
@@ -487,8 +624,8 @@ fn spawn_vcpu_runtime(
                     }
                     VcpuExit::IoOut(addr, data) => {
                         if addr >= COM1 && addr - COM1 < 8 {
-                            let _ = lock_host_serial(&stdio_serial)
-                                .write((addr - COM1) as u8, data[0]);
+                            let _ =
+                                lock_host_serial(&stdio_serial).write((addr - COM1) as u8, data[0]);
                         }
                     }
                     VcpuExit::MmioRead(addr, data) => {
@@ -510,13 +647,111 @@ fn spawn_vcpu_runtime(
                     }
                 },
                 Err(e) => {
+                    if vcpu_stopper.stop_requested()
+                        && e == vmm_sys_util::errno::Error::new(libc::EINTR)
+                    {
+                        break;
+                    }
+
                     println!("KVM Run error {:?}", e);
                     break;
                 }
             }
         }
+        vcpu_stopper.clear_thread();
         vcpu_exit_evt.trigger().unwrap();
     });
+}
+
+#[derive(Clone)]
+struct VcpuStopper {
+    stop_requested: Arc<AtomicBool>,
+    thread: Arc<Mutex<Option<libc::pthread_t>>>,
+    kvm_run: Arc<AtomicPtr<kvm_bindings::kvm_run>>,
+}
+
+impl VcpuStopper {
+    fn new() -> Self {
+        Self {
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            thread: Arc::new(Mutex::new(None)),
+            kvm_run: Arc::new(AtomicPtr::new(ptr::null_mut())),
+        }
+    }
+
+    fn set_thread(&self) {
+        *self.thread.lock().unwrap() = Some(unsafe { libc::pthread_self() });
+    }
+
+    fn clear_thread(&self) {
+        let mut thread = self.thread.lock().unwrap();
+        self.kvm_run.store(ptr::null_mut(), Ordering::SeqCst);
+        *thread = None;
+    }
+
+    fn set_kvm_run(&self, kvm_run: *mut kvm_bindings::kvm_run) {
+        self.kvm_run.store(kvm_run, Ordering::SeqCst);
+    }
+
+    fn request_stop(&self) -> io::Result<()> {
+        if self.stop_requested.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let thread = self.thread.lock().unwrap();
+        let kvm_run = self.kvm_run.load(Ordering::SeqCst);
+        if !kvm_run.is_null() {
+            unsafe {
+                ptr::write_volatile(ptr::addr_of_mut!((*kvm_run).immediate_exit), 1);
+            }
+        }
+
+        let Some(thread) = *thread else {
+            return Ok(());
+        };
+
+        let ret = unsafe { libc::pthread_kill(thread, VM_STOP_SIGNAL) };
+        if ret == 0 || ret == libc::ESRCH {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(ret))
+        }
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::SeqCst)
+    }
+}
+
+extern "C" fn handle_stop_signal(_signal: libc::c_int) {}
+
+fn install_stop_signal_handler() -> io::Result<()> {
+    match *STOP_SIGNAL_HANDLER_RESULT.get_or_init(|| unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handle_stop_signal as *const () as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = 0;
+        let ret = libc::sigaction(VM_STOP_SIGNAL, &action, std::ptr::null_mut());
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EINVAL))
+        }
+    }) {
+        Ok(()) => Ok(()),
+        Err(errno) => Err(io::Error::from_raw_os_error(errno)),
+    }
+}
+
+fn unblock_stop_signal() {
+    unsafe {
+        let mut signals: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut signals);
+        libc::sigaddset(&mut signals, VM_STOP_SIGNAL);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut());
+    }
 }
 
 fn lock_host_serial(serial: &Arc<Mutex<HostSerial>>) -> std::sync::MutexGuard<'_, HostSerial> {
@@ -527,8 +762,9 @@ fn lock_host_serial(serial: &Arc<Mutex<HostSerial>>) -> std::sync::MutexGuard<'_
 }
 
 fn path_to_str(path: &Path) -> VmManagerResult<&str> {
-    path.to_str()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8").into())
+    path.to_str().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8").into()
+    })
 }
 
 fn register_event(
@@ -580,7 +816,10 @@ mod tests {
         manager.add_vm(config.clone()).unwrap();
 
         let err = manager.add_vm(config).unwrap_err();
-        assert_eq!(err.downcast_ref::<io::Error>().unwrap().kind(), ErrorKind::AlreadyExists);
+        assert_eq!(
+            err.downcast_ref::<io::Error>().unwrap().kind(),
+            ErrorKind::AlreadyExists
+        );
     }
 
     // No vm in bag. Manager say no.
@@ -590,7 +829,67 @@ mod tests {
 
         let err = manager.run().unwrap_err();
 
-        assert_eq!(err.downcast_ref::<io::Error>().unwrap().kind(), ErrorKind::Other);
+        assert_eq!(
+            err.downcast_ref::<io::Error>().unwrap().kind(),
+            ErrorKind::Other
+        );
+    }
+
+    #[test]
+    fn request_stop_vm_rejects_missing_instance() {
+        let mut manager = VmManager::new();
+
+        let err = manager.request_stop_vm(1).unwrap_err();
+
+        assert_eq!(
+            err.downcast_ref::<io::Error>().unwrap().kind(),
+            ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn handle_commands_replies_to_stop_for_missing_instance() {
+        let mut manager = VmManager::new();
+        let (response_tx, response_rx) = mpsc::channel();
+
+        manager
+            .command_tx
+            .send(VmCommand::Stop {
+                id: 1,
+                response: response_tx,
+            })
+            .unwrap();
+
+        manager.handle_commands().unwrap();
+
+        let err = response_rx.recv().unwrap().unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<io::Error>().unwrap().kind(),
+            ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn handle_request_stop_vm_rejects_when_manager_is_not_running() {
+        let manager = VmManager::new();
+        let handle = manager.handle().unwrap();
+
+        let err = handle.request_stop_vm(1).unwrap_err();
+
+        assert_eq!(
+            err.downcast_ref::<io::Error>().unwrap().kind(),
+            ErrorKind::NotConnected
+        );
+    }
+
+    #[test]
+    fn vcpu_stopper_records_stop_before_thread_registration() {
+        let stopper = VcpuStopper::new();
+
+        stopper.request_stop().unwrap();
+        stopper.request_stop().unwrap();
+
+        assert!(stopper.stop_requested());
     }
 
     // Token count go up to 255, then no more token.
@@ -603,7 +902,10 @@ mod tests {
         assert_eq!(next_token_count, 256);
 
         let err = next_token(&mut next_token_count).unwrap_err();
-        assert_eq!(err.downcast_ref::<io::Error>().unwrap().kind(), ErrorKind::Other);
+        assert_eq!(
+            err.downcast_ref::<io::Error>().unwrap().kind(),
+            ErrorKind::Other
+        );
         assert_eq!(next_token_count, 256);
     }
 
