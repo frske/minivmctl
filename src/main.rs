@@ -48,6 +48,15 @@ fn main() {
         .expect("failed to provision guest");
     let block_path: PathBuf = provision::vm_rootfs_path(VM_ID);
     let tap_name = format!("tap{}", VM_ID);
+    let guest_ip = format!("10.10.0.{}", VM_ID + 2);
+
+    println!(
+        "Provisioned VM {}\n  rootfs: {}\n  tap: {}\n  guest ip: {}\n  gateway: 10.10.0.1\n  dns: 8.8.8.8",
+        VM_ID,
+        block_path.display(),
+        tap_name,
+        guest_ip,
+    );
 
     let BootArtifacts {
         vm,
