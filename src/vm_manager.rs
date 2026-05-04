@@ -14,6 +14,7 @@ use std::{
 
 use kvm_ioctls::{IoEventAddress, VcpuExit, VmFd};
 use vm_superio::{Serial, Trigger};
+use vm_memory::GuestMemoryMmap;
 use vmm_sys_util::{
     eventfd::EventFd,
     poll::{PollContext, PollEvents},
@@ -94,9 +95,6 @@ impl VmManagerHandle {
             })?
     }
 
-    pub fn stop_vm(&self, id: u8) -> VmManagerResult<()> {
-        self.request_stop_vm(id)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,12 +110,6 @@ enum EventKind {
 struct EventRoute {
     vm_id: u8,
     kind: EventKind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InstanceAction {
-    Continue,
-    Exit,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -243,7 +235,15 @@ impl VmManager {
 
         poll.add(&self.command_evt.0, COMMAND_TOKEN)
             .map_err(|e| io::Error::from_raw_os_error(e.errno()))?;
-        self.register_instance_events(&poll, &mut routes, &mut next_token_count)?;
+
+        let mut vm_ids = self.instances.keys().copied().collect::<Vec<_>>();
+        vm_ids.sort_unstable();
+        for vm_id in vm_ids {
+            self.instances
+                .get(&vm_id)
+                .unwrap()
+                .register_events(vm_id, &poll, &mut routes, &mut next_token_count)?;
+        }
 
         while !self.instances.is_empty() {
             let events: PollEvents<u8> = poll.wait().unwrap();
@@ -257,9 +257,19 @@ impl VmManager {
                     continue;
                 };
 
-                match self.dispatch_event(route, &poll, &mut routes, &mut next_token_count)? {
-                    InstanceAction::Continue => {}
-                    InstanceAction::Exit => self.remove_instance(route.vm_id, &mut routes),
+                let should_remove = match self.instances.get_mut(&route.vm_id) {
+                    Some(instance) => instance.handle_event(
+                        route.kind,
+                        route.vm_id,
+                        &poll,
+                        &mut routes,
+                        &mut next_token_count,
+                    )?,
+                    None => false,
+                };
+
+                if should_remove {
+                    self.cleanup_instance(route.vm_id, &mut routes);
                 }
             }
         }
@@ -300,56 +310,15 @@ impl VmManager {
         Ok(())
     }
 
-    fn register_instance_events(
-        &mut self,
-        poll: &PollContext<u8>,
-        routes: &mut HashMap<u8, EventRoute>,
-        next_token_count: &mut usize,
-    ) -> VmManagerResult<()> {
-        let mut vm_ids = self.instances.keys().copied().collect::<Vec<_>>();
-        vm_ids.sort_unstable();
-
-        for vm_id in vm_ids {
-            let instance = self.instances.get(&vm_id).unwrap();
-            instance.register_base_events(vm_id, poll, routes, next_token_count)?;
-        }
-
-        Ok(())
-    }
-
-    fn dispatch_event(
-        &mut self,
-        route: EventRoute,
-        poll: &PollContext<u8>,
-        routes: &mut HashMap<u8, EventRoute>,
-        next_token_count: &mut usize,
-    ) -> VmManagerResult<InstanceAction> {
-        let Some(instance) = self.instances.get_mut(&route.vm_id) else {
-            return Ok(InstanceAction::Continue);
-        };
-
-        match route.kind {
-            EventKind::Exit => Ok(instance.handle_exit()),
-            EventKind::NetActivate => {
-                instance.handle_net_activate(route.vm_id, poll, routes, next_token_count)
-            }
-            EventKind::TapRx => instance.handle_tap_rx(),
-            EventKind::NetQueue(idx) => instance.handle_net_queue(idx),
-            EventKind::BlkQueue(idx) => instance.handle_blk_queue(idx),
-        }
-    }
-
-    fn remove_instance(&mut self, vm_id: u8, routes: &mut HashMap<u8, EventRoute>) {
+    fn cleanup_instance(&mut self, vm_id: u8, routes: &mut HashMap<u8, EventRoute>) {
         routes.retain(|_, route| route.vm_id != vm_id);
         self.instances.remove(&vm_id);
-        let _ = provision::deprovision_guest(vm_id);
-        let _ = provision::deprovision_vm_host(vm_id);
+        cleanup_vm_resources(vm_id);
     }
 
     fn cleanup_instances(&mut self) {
         for vm_id in self.instances.keys().copied().collect::<Vec<_>>() {
-            let _ = provision::deprovision_guest(vm_id);
-            let _ = provision::deprovision_vm_host(vm_id);
+            cleanup_vm_resources(vm_id);
         }
 
         self.instances.clear();
@@ -374,19 +343,52 @@ struct VmInstance {
     id: u8,
     _vm: VmFd,
     vcpu_stopper: VcpuStopper,
-    virtio_net_activate_evt: EventFd,
-    virtio_net_queue_events: Vec<EventFd>,
-    virtio_net: Arc<Mutex<Net>>,
-    virtio_blk_queue_events: Vec<EventFd>,
-    virtio_blk: Arc<Mutex<Blk>>,
+    net: NetDeviceRuntime,
+    blk: BlkDeviceRuntime,
     exit_evt: EventWrapper,
     tap_rx_registered: bool,
+}
+
+struct NetDeviceRuntime {
+    device: Arc<Mutex<Net>>,
+    activate_evt: EventFd,
+    queue_events: Vec<EventFd>,
+}
+
+struct BlkDeviceRuntime {
+    device: Arc<Mutex<Blk>>,
+    queue_events: Vec<EventFd>,
 }
 
 impl VmInstance {
     fn start(config: VmConfig) -> VmManagerResult<Self> {
         install_stop_signal_handler()?;
 
+        Self::provision_vm(&config);
+
+        let BootArtifacts {
+            vm,
+            vcpu,
+            guest_mem,
+        } = Self::boot_vm(&config)?;
+        let mut mmio_bus = MMIOBus::new();
+        let net = Self::create_net_device(&config, &vm, &guest_mem, &mut mmio_bus);
+        let blk = Self::create_blk_device(&config, &vm, &guest_mem, &mut mmio_bus);
+        let stdio_serial = Self::create_serial(&vm);
+        let (vcpu_stopper, exit_evt) = Self::start_vcpu(vcpu, stdio_serial, mmio_bus);
+
+        Ok(Self {
+            id: config.id(),
+            _vm: vm,
+            vcpu_stopper,
+            net,
+            blk,
+            exit_evt,
+            tap_rx_registered: false,
+        })
+    }
+
+    fn provision_vm(config: &VmConfig) {
         provision::provision_vm_host(config.id()).expect("failed to provision host");
         let public_ssh_key =
             fs::read_to_string(&config.ssh_key_path).expect("failed to read SSH key");
@@ -400,15 +402,18 @@ impl VmInstance {
             config.tap_name(),
             config.guest_ip(),
         );
+    }
 
-        let BootArtifacts {
-            vm,
-            vcpu,
-            guest_mem,
-        } = boot::setup(path_to_str(&config.kernel_path)?);
+    fn boot_vm(config: &VmConfig) -> VmManagerResult<BootArtifacts> {
+        Ok(boot::setup(path_to_str(&config.kernel_path)?))
+    }
 
-        let mut mmio_bus = MMIOBus::new();
-
+    fn create_net_device(
+        config: &VmConfig,
+        vm: &VmFd,
+        guest_mem: &GuestMemoryMmap<()>,
+        mmio_bus: &mut MMIOBus,
+    ) -> NetDeviceRuntime {
         let virtio_net = net::Net::new(&config.tap_name(), Some(config.guest_mac()))
             .expect("failed to create virtio net");
         vm.register_irqfd(virtio_net.interrupt_event(), 5).unwrap();
@@ -417,17 +422,30 @@ impl VmInstance {
             vm.register_ioevent(evt, &addr, q_sel as u32).unwrap();
         }
 
-        let virtio_net_activate_evt = virtio_net.activate_event.try_clone().unwrap();
-        let virtio_net_queue_events = virtio_net
+        let activate_evt = virtio_net.activate_event.try_clone().unwrap();
+        let queue_events = virtio_net
             .queues_events()
             .iter()
             .map(|evt| evt.try_clone().unwrap())
             .collect::<Vec<_>>();
-        let virtio_net = Arc::new(Mutex::new(virtio_net));
+        let device = Arc::new(Mutex::new(virtio_net));
         mmio_bus
-            .insert_virtio(MMIO_MEM_START, virtio_net.clone(), guest_mem.clone())
+            .insert_virtio(MMIO_MEM_START, device.clone(), guest_mem.clone())
             .expect("insert virtio net mmio");
 
+        NetDeviceRuntime {
+            device,
+            activate_evt,
+            queue_events,
+        }
+    }
+
+    fn create_blk_device(
+        config: &VmConfig,
+        vm: &VmFd,
+        guest_mem: &GuestMemoryMmap<()>,
+        mmio_bus: &mut MMIOBus,
+    ) -> BlkDeviceRuntime {
         let virtio_blk = Blk::new(
             OpenOptions::new()
                 .read(true)
@@ -441,25 +459,39 @@ impl VmInstance {
             let addr = IoEventAddress::Mmio(QUEUE_NOTIFY_OFFSET + BLK_MMIO_MEM_START);
             vm.register_ioevent(evt, &addr, q_sel as u32).unwrap();
         }
-        let virtio_blk_queue_events = virtio_blk
+
+        let queue_events = virtio_blk
             .queues_events()
             .iter()
             .map(|evt| evt.try_clone().unwrap())
             .collect::<Vec<_>>();
-        let virtio_blk = Arc::new(Mutex::new(virtio_blk));
+        let device = Arc::new(Mutex::new(virtio_blk));
         mmio_bus
-            .insert_virtio(BLK_MMIO_MEM_START, virtio_blk.clone(), guest_mem.clone())
+            .insert_virtio(BLK_MMIO_MEM_START, device.clone(), guest_mem.clone())
             .expect("insert virtio blk mmio");
 
+        BlkDeviceRuntime {
+            device,
+            queue_events,
+        }
+    }
+
+    fn create_serial(vm: &VmFd) -> Arc<Mutex<HostSerial>> {
         let com_evt_1 = EventWrapper::new();
         vm.register_irqfd(&com_evt_1.0, 4).unwrap();
 
-        let stdio_serial = Arc::new(Mutex::new(Serial::with_events(
+        Arc::new(Mutex::new(Serial::with_events(
             com_evt_1.try_clone().unwrap(),
             DummySerialEvent,
             std::io::sink(),
-        )));
+        )))
+    }
 
+    fn start_vcpu(
+        vcpu: kvm_ioctls::VcpuFd,
+        stdio_serial: Arc<Mutex<HostSerial>>,
+        mmio_bus: MMIOBus,
+    ) -> (VcpuStopper, EventWrapper) {
         let exit_evt = EventWrapper::new();
         let vcpu_stopper = VcpuStopper::new();
         spawn_vcpu_runtime(
@@ -470,18 +502,7 @@ impl VmInstance {
             vcpu_stopper.clone(),
         );
 
-        Ok(Self {
-            id: config.id(),
-            _vm: vm,
-            vcpu_stopper,
-            virtio_net_activate_evt,
-            virtio_net_queue_events,
-            virtio_net,
-            virtio_blk_queue_events,
-            virtio_blk,
-            exit_evt,
-            tap_rx_registered: false,
-        })
+        (vcpu_stopper, exit_evt)
     }
 
     fn request_stop(&self) -> VmManagerResult<()> {
@@ -489,7 +510,7 @@ impl VmInstance {
         Ok(())
     }
 
-    fn register_base_events(
+    fn register_events(
         &self,
         vm_id: u8,
         poll: &PollContext<u8>,
@@ -508,7 +529,7 @@ impl VmInstance {
         )?;
         register_event(
             poll,
-            &self.virtio_net_activate_evt,
+            &self.net.activate_evt,
             EventRoute {
                 vm_id,
                 kind: EventKind::NetActivate,
@@ -516,7 +537,7 @@ impl VmInstance {
             routes,
             next_token_count,
         )?;
-        for (q_sel, evt) in self.virtio_net_queue_events.iter().enumerate() {
+        for (q_sel, evt) in self.net.queue_events.iter().enumerate() {
             register_event(
                 poll,
                 evt,
@@ -528,7 +549,7 @@ impl VmInstance {
                 next_token_count,
             )?;
         }
-        for (q_sel, evt) in self.virtio_blk_queue_events.iter().enumerate() {
+        for (q_sel, evt) in self.blk.queue_events.iter().enumerate() {
             register_event(
                 poll,
                 evt,
@@ -544,58 +565,78 @@ impl VmInstance {
         Ok(())
     }
 
-    fn handle_exit(&self) -> InstanceAction {
-        println!("vcpu stopped, main loop exit for vm {}", self.id);
-        InstanceAction::Exit
+    fn handle_event(
+        &mut self,
+        kind: EventKind,
+        vm_id: u8,
+        poll: &PollContext<u8>,
+        routes: &mut HashMap<u8, EventRoute>,
+        next_token_count: &mut usize,
+    ) -> VmManagerResult<bool> {
+        match kind {
+            EventKind::Exit => {
+                println!("vcpu stopped, main loop exit for vm {}", self.id);
+                Ok(true)
+            }
+            EventKind::NetActivate => {
+                let _ = self.net.activate_evt.read().unwrap();
+                self.register_tap_rx(vm_id, poll, routes, next_token_count)?;
+                Ok(false)
+            }
+            EventKind::TapRx => {
+                let mut net = self.net.device.lock().unwrap();
+                let _ = net.process_rx();
+                Ok(false)
+            }
+            EventKind::NetQueue(idx) => {
+                let _ = self.net.queue_events[idx].read().unwrap();
+                let mut net = self.net.device.lock().unwrap();
+                let _ = net.process_tx();
+                Ok(false)
+            }
+            EventKind::BlkQueue(idx) => {
+                let _ = self.blk.queue_events[idx].read().unwrap();
+                let mut blk = self.blk.device.lock().unwrap();
+                let _ = blk.process_queue();
+                Ok(false)
+            }
+        }
     }
 
-    fn handle_net_activate(
+    fn register_tap_rx(
         &mut self,
         vm_id: u8,
         poll: &PollContext<u8>,
         routes: &mut HashMap<u8, EventRoute>,
         next_token_count: &mut usize,
-    ) -> VmManagerResult<InstanceAction> {
-        let _ = self.virtio_net_activate_evt.read().unwrap();
-        if !self.tap_rx_registered {
-            let token = next_token(next_token_count)?;
-            self.virtio_net
-                .lock()
-                .unwrap()
-                .register_tap_readable(poll, token)
-                .unwrap();
-            routes.insert(
-                token,
-                EventRoute {
-                    vm_id,
-                    kind: EventKind::TapRx,
-                },
-            );
-            self.tap_rx_registered = true;
+    ) -> VmManagerResult<()> {
+        if self.tap_rx_registered {
+            return Ok(());
         }
 
-        Ok(InstanceAction::Continue)
-    }
+        let token = next_token(next_token_count)?;
+        self.net
+            .device
+            .lock()
+            .unwrap()
+            .register_tap_readable(poll, token)
+            .unwrap();
+        routes.insert(
+            token,
+            EventRoute {
+                vm_id,
+                kind: EventKind::TapRx,
+            },
+        );
+        self.tap_rx_registered = true;
 
-    fn handle_tap_rx(&mut self) -> VmManagerResult<InstanceAction> {
-        let mut net = self.virtio_net.lock().unwrap();
-        let _ = net.process_rx();
-        Ok(InstanceAction::Continue)
+        Ok(())
     }
+}
 
-    fn handle_net_queue(&mut self, idx: usize) -> VmManagerResult<InstanceAction> {
-        let _ = self.virtio_net_queue_events[idx].read().unwrap();
-        let mut net = self.virtio_net.lock().unwrap();
-        let _ = net.process_tx();
-        Ok(InstanceAction::Continue)
-    }
-
-    fn handle_blk_queue(&mut self, idx: usize) -> VmManagerResult<InstanceAction> {
-        let _ = self.virtio_blk_queue_events[idx].read().unwrap();
-        let mut blk = self.virtio_blk.lock().unwrap();
-        let _ = blk.process_queue();
-        Ok(InstanceAction::Continue)
-    }
+fn cleanup_vm_resources(vm_id: u8) {
+    let _ = provision::deprovision_guest(vm_id);
+    let _ = provision::deprovision_vm_host(vm_id);
 }
 
 fn spawn_vcpu_runtime(
@@ -929,7 +970,7 @@ mod tests {
 
     // Remove one vm route. Other vm route stay.
     #[test]
-    fn remove_instance_prunes_only_target_vm_routes() {
+    fn cleanup_instance_prunes_only_target_vm_routes() {
         let mut manager = VmManager::new();
         let mut routes = HashMap::from([
             (
@@ -955,7 +996,7 @@ mod tests {
             ),
         ]);
 
-        manager.remove_instance(3, &mut routes);
+        manager.cleanup_instance(3, &mut routes);
 
         assert_eq!(routes.len(), 1);
         assert_eq!(
@@ -969,24 +1010,25 @@ mod tests {
 
     // Route point to no vm. Manager do nothing.
     #[test]
-    fn dispatch_event_ignores_missing_instance_route() {
+    fn missing_instance_route_is_ignored() {
         let mut manager = VmManager::new();
         let poll: PollContext<u8> = PollContext::new().unwrap();
         let mut routes = HashMap::new();
         let mut next_token_count = 0;
 
-        let action = manager
-            .dispatch_event(
-                EventRoute {
-                    vm_id: 11,
-                    kind: EventKind::Exit,
-                },
-                &poll,
-                &mut routes,
-                &mut next_token_count,
-            )
-            .unwrap();
+        let should_remove = match manager.instances.get_mut(&11) {
+            Some(instance) => instance
+                .handle_event(
+                    EventKind::Exit,
+                    11,
+                    &poll,
+                    &mut routes,
+                    &mut next_token_count,
+                )
+                .unwrap(),
+            None => false,
+        };
 
-        assert_eq!(action, InstanceAction::Continue);
+        assert!(!should_remove);
     }
 }
