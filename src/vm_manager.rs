@@ -13,8 +13,8 @@ use std::{
 };
 
 use kvm_ioctls::{IoEventAddress, VcpuExit, VmFd};
-use vm_superio::{Serial, Trigger};
 use vm_memory::GuestMemoryMmap;
+use vm_superio::{Serial, Trigger};
 use vmm_sys_util::{
     eventfd::EventFd,
     poll::{PollContext, PollEvents},
@@ -44,6 +44,13 @@ const VM_STOP_SIGNAL: libc::c_int = libc::SIGUSR1;
 static STOP_SIGNAL_HANDLER_RESULT: OnceLock<Result<(), i32>> = OnceLock::new();
 
 enum VmCommand {
+    Start {
+        config: VmConfig,
+        response: mpsc::Sender<VmManagerResult<()>>,
+    },
+    List {
+        response: mpsc::Sender<VmManagerResult<Vec<VmInfo>>>,
+    },
     Stop {
         id: u8,
         response: mpsc::Sender<VmManagerResult<()>>,
@@ -67,34 +74,63 @@ impl Clone for VmManagerHandle {
 }
 
 impl VmManagerHandle {
+    pub fn start_vm(&self, config: VmConfig) -> VmManagerResult<()> {
+        self.send_command(
+            "vm manager is not running",
+            Duration::from_secs(120),
+            |response| VmCommand::Start { config, response },
+        )
+    }
+
+    pub fn list_vms(&self) -> VmManagerResult<Vec<VmInfo>> {
+        self.send_command(
+            "vm manager is not running",
+            Duration::from_secs(5),
+            |response| VmCommand::List { response },
+        )
+    }
+
     /// Requests a hard stop and returns when the manager accepts the request.
     /// VM cleanup completes later through the existing vCPU exit event path.
     pub fn request_stop_vm(&self, id: u8) -> VmManagerResult<()> {
+        self.send_command(
+            "vm manager is not running",
+            Duration::from_secs(5),
+            |response| VmCommand::Stop { id, response },
+        )
+    }
+
+    fn send_command<T>(
+        &self,
+        not_running_message: &'static str,
+        timeout: Duration,
+        command: impl FnOnce(mpsc::Sender<VmManagerResult<T>>) -> VmCommand,
+    ) -> VmManagerResult<T> {
         if !self.manager_running.load(Ordering::SeqCst) {
-            return Err(
-                io::Error::new(io::ErrorKind::NotConnected, "vm manager is not running").into(),
-            );
+            return Err(io::Error::new(io::ErrorKind::NotConnected, not_running_message).into());
         }
 
         let (response_tx, response_rx) = mpsc::channel();
         self.command_tx
-            .send(VmCommand::Stop {
-                id,
-                response: response_tx,
-            })
+            .send(command(response_tx))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "vm manager is not running"))?;
         self.command_evt.as_ref().trigger()?;
-        response_rx
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|err| {
-                let kind = match err {
-                    mpsc::RecvTimeoutError::Timeout => io::ErrorKind::TimedOut,
-                    mpsc::RecvTimeoutError::Disconnected => io::ErrorKind::BrokenPipe,
-                };
-                io::Error::new(kind, "vm manager did not process stop command")
-            })?
+        response_rx.recv_timeout(timeout).map_err(|err| {
+            let kind = match err {
+                mpsc::RecvTimeoutError::Timeout => io::ErrorKind::TimedOut,
+                mpsc::RecvTimeoutError::Disconnected => io::ErrorKind::BrokenPipe,
+            };
+            io::Error::new(kind, "vm manager did not process command")
+        })?
     }
+}
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmInfo {
+    pub id: u8,
+    pub kernel_path: PathBuf,
+    pub ssh_key_path: PathBuf,
+    pub status: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,19 +252,6 @@ impl VmManager {
     }
 
     fn run_inner(&mut self) -> VmManagerResult<()> {
-        if self.instances.is_empty() && self.configs.is_empty() {
-            return Err(io::Error::other("vm manager requires at least one configured vm").into());
-        }
-
-        if !self.shared_host_provisioned {
-            provision::provision_shared_host()?;
-            self.shared_host_provisioned = true;
-        }
-
-        if self.instances.is_empty() {
-            self.start_configured_vms()?;
-        }
-
         let poll: PollContext<u8> = PollContext::new().unwrap();
         let mut routes = HashMap::new();
         let mut next_token_count = 1usize;
@@ -236,20 +259,13 @@ impl VmManager {
         poll.add(&self.command_evt.0, COMMAND_TOKEN)
             .map_err(|e| io::Error::from_raw_os_error(e.errno()))?;
 
-        let mut vm_ids = self.instances.keys().copied().collect::<Vec<_>>();
-        vm_ids.sort_unstable();
-        for vm_id in vm_ids {
-            self.instances
-                .get(&vm_id)
-                .unwrap()
-                .register_events(vm_id, &poll, &mut routes, &mut next_token_count)?;
-        }
+        self.start_configured_vms(&poll, &mut routes, &mut next_token_count)?;
 
-        while !self.instances.is_empty() {
+        loop {
             let events: PollEvents<u8> = poll.wait().unwrap();
             for event in events.iter_readable() {
                 if event.token() == COMMAND_TOKEN {
-                    self.handle_commands()?;
+                    self.handle_commands(&poll, &mut routes, &mut next_token_count)?;
                     continue;
                 }
 
@@ -270,18 +286,30 @@ impl VmManager {
 
                 if should_remove {
                     self.cleanup_instance(route.vm_id, &mut routes);
+                    if self.instances.is_empty() {
+                        self.cleanup_shared_host();
+                    }
                 }
             }
         }
-
-        Ok(())
     }
 
-    fn handle_commands(&mut self) -> VmManagerResult<()> {
+    fn handle_commands(
+        &mut self,
+        poll: &PollContext<u8>,
+        routes: &mut HashMap<u8, EventRoute>,
+        next_token_count: &mut usize,
+    ) -> VmManagerResult<()> {
         let _ = self.command_evt.read();
 
         while let Ok(command) = self.command_rx.try_recv() {
             match command {
+                VmCommand::Start { config, response } => {
+                    let _ = response.send(self.start_vm(config, poll, routes, next_token_count));
+                }
+                VmCommand::List { response } => {
+                    let _ = response.send(Ok(self.list_vms()));
+                }
                 VmCommand::Stop { id, response } => {
                     let _ = response.send(self.request_stop_vm(id));
                 }
@@ -299,15 +327,79 @@ impl VmManager {
         instance.request_stop()
     }
 
-    fn start_configured_vms(&mut self) -> VmManagerResult<()> {
+    fn start_configured_vms(
+        &mut self,
+        poll: &PollContext<u8>,
+        routes: &mut HashMap<u8, EventRoute>,
+        next_token_count: &mut usize,
+    ) -> VmManagerResult<()> {
         let configs = std::mem::take(&mut self.configs);
 
-        for (vm_id, config) in configs {
-            let instance = VmInstance::start(config)?;
-            self.instances.insert(vm_id, instance);
+        for config in configs.into_values() {
+            self.start_vm(config, poll, routes, next_token_count)?;
         }
 
         Ok(())
+    }
+
+    fn start_vm(
+        &mut self,
+        config: VmConfig,
+        poll: &PollContext<u8>,
+        routes: &mut HashMap<u8, EventRoute>,
+        next_token_count: &mut usize,
+    ) -> VmManagerResult<()> {
+        if self.configs.contains_key(&config.id()) || self.instances.contains_key(&config.id()) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("duplicate vm id {}", config.id()),
+            )
+            .into());
+        }
+
+        let had_instances = !self.instances.is_empty();
+        if !self.shared_host_provisioned {
+            provision::provision_shared_host()?;
+            self.shared_host_provisioned = true;
+        }
+
+        let vm_id = config.id();
+        let instance = match VmInstance::start(config) {
+            Ok(instance) => instance,
+            Err(err) => {
+                cleanup_vm_resources(vm_id);
+                if !had_instances {
+                    self.cleanup_shared_host();
+                }
+                return Err(err);
+            }
+        };
+        self.instances.insert(vm_id, instance);
+
+        if let Err(err) = self.instances.get(&vm_id).unwrap().register_events(
+            vm_id,
+            poll,
+            routes,
+            next_token_count,
+        ) {
+            self.cleanup_instance(vm_id, routes);
+            if !had_instances {
+                self.cleanup_shared_host();
+            }
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    fn list_vms(&self) -> Vec<VmInfo> {
+        let mut vms = self
+            .instances
+            .values()
+            .map(VmInstance::info)
+            .collect::<Vec<_>>();
+        vms.sort_by_key(|vm| vm.id);
+        vms
     }
 
     fn cleanup_instance(&mut self, vm_id: u8, routes: &mut HashMap<u8, EventRoute>) {
@@ -341,6 +433,7 @@ impl Drop for VmManager {
 
 struct VmInstance {
     id: u8,
+    config: VmConfig,
     _vm: VmFd,
     vcpu_stopper: VcpuStopper,
     net: NetDeviceRuntime,
@@ -379,6 +472,7 @@ impl VmInstance {
 
         Ok(Self {
             id: config.id(),
+            config,
             _vm: vm,
             vcpu_stopper,
             net,
@@ -508,6 +602,15 @@ impl VmInstance {
     fn request_stop(&self) -> VmManagerResult<()> {
         self.vcpu_stopper.request_stop()?;
         Ok(())
+    }
+
+    fn info(&self) -> VmInfo {
+        VmInfo {
+            id: self.id,
+            kernel_path: self.config.kernel_path.clone(),
+            ssh_key_path: self.config.ssh_key_path.clone(),
+            status: "running",
+        }
     }
 
     fn register_events(
@@ -863,19 +966,6 @@ mod tests {
         );
     }
 
-    // No vm in bag. Manager say no.
-    #[test]
-    fn run_rejects_empty_manager() {
-        let mut manager = VmManager::new();
-
-        let err = manager.run().unwrap_err();
-
-        assert_eq!(
-            err.downcast_ref::<io::Error>().unwrap().kind(),
-            ErrorKind::Other
-        );
-    }
-
     #[test]
     fn request_stop_vm_rejects_missing_instance() {
         let mut manager = VmManager::new();
@@ -891,6 +981,9 @@ mod tests {
     #[test]
     fn handle_commands_replies_to_stop_for_missing_instance() {
         let mut manager = VmManager::new();
+        let poll: PollContext<u8> = PollContext::new().unwrap();
+        let mut routes = HashMap::new();
+        let mut next_token_count = 0;
         let (response_tx, response_rx) = mpsc::channel();
 
         manager
@@ -901,7 +994,9 @@ mod tests {
             })
             .unwrap();
 
-        manager.handle_commands().unwrap();
+        manager
+            .handle_commands(&poll, &mut routes, &mut next_token_count)
+            .unwrap();
 
         let err = response_rx.recv().unwrap().unwrap_err();
         assert_eq!(
@@ -911,11 +1006,60 @@ mod tests {
     }
 
     #[test]
+    fn handle_commands_replies_to_list_with_running_vms() {
+        let mut manager = VmManager::new();
+        let poll: PollContext<u8> = PollContext::new().unwrap();
+        let mut routes = HashMap::new();
+        let mut next_token_count = 0;
+        let (response_tx, response_rx) = mpsc::channel();
+
+        manager
+            .command_tx
+            .send(VmCommand::List {
+                response: response_tx,
+            })
+            .unwrap();
+
+        manager
+            .handle_commands(&poll, &mut routes, &mut next_token_count)
+            .unwrap();
+
+        assert_eq!(response_rx.recv().unwrap().unwrap(), Vec::new());
+    }
+
+    #[test]
     fn handle_request_stop_vm_rejects_when_manager_is_not_running() {
         let manager = VmManager::new();
         let handle = manager.handle().unwrap();
 
         let err = handle.request_stop_vm(1).unwrap_err();
+
+        assert_eq!(
+            err.downcast_ref::<io::Error>().unwrap().kind(),
+            ErrorKind::NotConnected
+        );
+    }
+
+    #[test]
+    fn handle_start_vm_rejects_when_manager_is_not_running() {
+        let manager = VmManager::new();
+        let handle = manager.handle().unwrap();
+        let config = VmConfig::new(1, "/kernel", "/ssh").unwrap();
+
+        let err = handle.start_vm(config).unwrap_err();
+
+        assert_eq!(
+            err.downcast_ref::<io::Error>().unwrap().kind(),
+            ErrorKind::NotConnected
+        );
+    }
+
+    #[test]
+    fn handle_list_vms_rejects_when_manager_is_not_running() {
+        let manager = VmManager::new();
+        let handle = manager.handle().unwrap();
+
+        let err = handle.list_vms().unwrap_err();
 
         assert_eq!(
             err.downcast_ref::<io::Error>().unwrap().kind(),
