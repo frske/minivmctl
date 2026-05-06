@@ -3,11 +3,12 @@ use std::{
     fs,
     fs::OpenOptions,
     io,
-    path::{Path, PathBuf},
+    path::PathBuf,
     ptr,
     sync::{
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicPtr, Ordering},
-        mpsc, Arc, Mutex, OnceLock,
+        mpsc,
     },
     time::Duration,
 };
@@ -37,16 +38,16 @@ pub type VmManagerResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>
 const BLK_MMIO_MEM_START: u64 = MMIO_MEM_START + 0x1000;
 const COM1: u16 = 0x3f8;
 const COMMAND_TOKEN: u8 = 0;
+const KERNEL_PATH: &str = "/home/frsk/prj/kernel_images/linux-6.6.99/vmlinux";
 const MMIO_MEM_START: u64 = 0xd0000000;
 const QUEUE_NOTIFY_OFFSET: u64 = 0x50;
-const MAX_VM_ID: u8 = 252;
+const SSH_KEY_PATH: &str = "/home/frsk/.ssh/id_ed25519.pub";
 const VM_STOP_SIGNAL: libc::c_int = libc::SIGUSR1;
 static STOP_SIGNAL_HANDLER_RESULT: OnceLock<Result<(), i32>> = OnceLock::new();
 
 enum VmCommand {
     Start {
-        config: VmConfig,
-        response: mpsc::Sender<VmManagerResult<()>>,
+        response: mpsc::Sender<VmManagerResult<VmInfo>>,
     },
     List {
         response: mpsc::Sender<VmManagerResult<Vec<VmInfo>>>,
@@ -74,11 +75,11 @@ impl Clone for VmManagerHandle {
 }
 
 impl VmManagerHandle {
-    pub fn start_vm(&self, config: VmConfig) -> VmManagerResult<()> {
+    pub fn start_vm(&self) -> VmManagerResult<VmInfo> {
         self.send_command(
             "vm manager is not running",
             Duration::from_secs(120),
-            |response| VmCommand::Start { config, response },
+            |response| VmCommand::Start { response },
         )
     }
 
@@ -128,8 +129,6 @@ impl VmManagerHandle {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmInfo {
     pub id: u8,
-    pub kernel_path: PathBuf,
-    pub ssh_key_path: PathBuf,
     pub status: &'static str,
 }
 
@@ -151,31 +150,9 @@ struct EventRoute {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmConfig {
     id: u8,
-    kernel_path: PathBuf,
-    ssh_key_path: PathBuf,
 }
 
 impl VmConfig {
-    pub fn new(
-        id: u8,
-        kernel_path: impl Into<PathBuf>,
-        ssh_key_path: impl Into<PathBuf>,
-    ) -> VmManagerResult<Self> {
-        if id > MAX_VM_ID {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("vm id must be <= {MAX_VM_ID}"),
-            )
-            .into());
-        }
-
-        Ok(Self {
-            id,
-            kernel_path: kernel_path.into(),
-            ssh_key_path: ssh_key_path.into(),
-        })
-    }
-
     pub fn id(&self) -> u8 {
         self.id
     }
@@ -205,6 +182,7 @@ pub struct VmManager {
     command_rx: mpsc::Receiver<VmCommand>,
     command_evt: Arc<EventWrapper>,
     manager_running: Arc<AtomicBool>,
+    next_vm_id: u8,
 }
 
 impl VmManager {
@@ -218,6 +196,7 @@ impl VmManager {
             command_rx,
             command_evt: Arc::new(EventWrapper::new()),
             manager_running: Arc::new(AtomicBool::new(false)),
+            next_vm_id: 0,
         }
     }
 
@@ -304,7 +283,8 @@ impl VmManager {
 
         while let Ok(command) = self.command_rx.try_recv() {
             match command {
-                VmCommand::Start { config, response } => {
+                VmCommand::Start { response } => {
+                    let config = self.vm_config();
                     let _ = response.send(self.start_vm(config, poll, routes, next_token_count));
                 }
                 VmCommand::List { response } => {
@@ -342,13 +322,25 @@ impl VmManager {
         Ok(())
     }
 
+    fn next_avail_id(&mut self) -> u8 {
+        let id = self.next_vm_id;
+        self.next_vm_id += 1;
+        id
+    }
+
+    fn vm_config(&mut self) -> VmConfig {
+        VmConfig {
+            id: self.next_avail_id(),
+        }
+    }
+
     fn start_vm(
         &mut self,
         config: VmConfig,
         poll: &PollContext<u8>,
         routes: &mut HashMap<u8, EventRoute>,
         next_token_count: &mut usize,
-    ) -> VmManagerResult<()> {
+    ) -> VmManagerResult<VmInfo> {
         if self.configs.contains_key(&config.id()) || self.instances.contains_key(&config.id()) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -389,7 +381,7 @@ impl VmManager {
             return Err(err);
         }
 
-        Ok(())
+        Ok(self.instances.get(&vm_id).unwrap().info())
     }
 
     fn list_vms(&self) -> Vec<VmInfo> {
@@ -433,7 +425,6 @@ impl Drop for VmManager {
 
 struct VmInstance {
     id: u8,
-    config: VmConfig,
     _vm: VmFd,
     vcpu_stopper: VcpuStopper,
     net: NetDeviceRuntime,
@@ -472,7 +463,6 @@ impl VmInstance {
 
         Ok(Self {
             id: config.id(),
-            config,
             _vm: vm,
             vcpu_stopper,
             net,
@@ -484,8 +474,7 @@ impl VmInstance {
 
     fn provision_vm(config: &VmConfig) {
         provision::provision_vm_host(config.id()).expect("failed to provision host");
-        let public_ssh_key =
-            fs::read_to_string(&config.ssh_key_path).expect("failed to read SSH key");
+        let public_ssh_key = fs::read_to_string(SSH_KEY_PATH).expect("failed to read SSH key");
         provision::provision_guest(config.id(), public_ssh_key.trim_end())
             .expect("failed to provision guest");
 
@@ -499,7 +488,8 @@ impl VmInstance {
     }
 
     fn boot_vm(config: &VmConfig) -> VmManagerResult<BootArtifacts> {
-        Ok(boot::setup(path_to_str(&config.kernel_path)?))
+        let _ = config;
+        Ok(boot::setup(KERNEL_PATH))
     }
 
     fn create_net_device(
@@ -607,8 +597,6 @@ impl VmInstance {
     fn info(&self) -> VmInfo {
         VmInfo {
             id: self.id,
-            kernel_path: self.config.kernel_path.clone(),
-            ssh_key_path: self.config.ssh_key_path.clone(),
             status: "running",
         }
     }
@@ -905,12 +893,6 @@ fn lock_host_serial(serial: &Arc<Mutex<HostSerial>>) -> std::sync::MutexGuard<'_
     }
 }
 
-fn path_to_str(path: &Path) -> VmManagerResult<&str> {
-    path.to_str().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8").into()
-    })
-}
-
 fn register_event(
     poll: &PollContext<u8>,
     fd: &impl std::os::fd::AsRawFd,
@@ -937,9 +919,13 @@ mod tests {
     use super::*;
     use std::{collections::HashMap, io::ErrorKind};
 
+    fn test_config(id: u8) -> VmConfig {
+        VmConfig { id }
+    }
+
     #[test]
     fn vm_config_derives_identity_from_id() {
-        let config = VmConfig::new(7, "/kernel", "/ssh").unwrap();
+        let config = test_config(7);
 
         assert_eq!(config.tap_name(), "tap7");
         assert_eq!(config.guest_ip(), "10.10.0.9");
@@ -948,14 +934,9 @@ mod tests {
     }
 
     #[test]
-    fn vm_config_rejects_invalid_id_range() {
-        assert!(VmConfig::new(253, "/kernel", "/ssh").is_err());
-    }
-
-    #[test]
     fn add_vm_rejects_duplicate_ids() {
         let mut manager = VmManager::new();
-        let config = VmConfig::new(1, "/kernel", "/ssh").unwrap();
+        let config = test_config(1);
 
         manager.add_vm(config.clone()).unwrap();
 
@@ -1044,14 +1025,21 @@ mod tests {
     fn handle_start_vm_rejects_when_manager_is_not_running() {
         let manager = VmManager::new();
         let handle = manager.handle().unwrap();
-        let config = VmConfig::new(1, "/kernel", "/ssh").unwrap();
 
-        let err = handle.start_vm(config).unwrap_err();
+        let err = handle.start_vm().unwrap_err();
 
         assert_eq!(
             err.downcast_ref::<io::Error>().unwrap().kind(),
             ErrorKind::NotConnected
         );
+    }
+
+    #[test]
+    fn next_avail_id_returns_current_id_then_advances() {
+        let mut manager = VmManager::new();
+
+        assert_eq!(manager.next_avail_id(), 0);
+        assert_eq!(manager.next_avail_id(), 1);
     }
 
     #[test]
