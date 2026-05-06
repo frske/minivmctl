@@ -1,3 +1,4 @@
+pub mod api;
 pub mod blk;
 pub mod boot;
 pub mod bus;

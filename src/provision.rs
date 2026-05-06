@@ -234,9 +234,7 @@ fn remove_bridge() -> ProvisionResult<()> {
         return Ok(());
     }
 
-    let status = Command::new("ip")
-        .args(["link", "del", "br0"])
-        .status()?;
+    let status = Command::new("ip").args(["link", "del", "br0"]).status()?;
 
     if !status.success() {
         return Err("failed deleting br0 interface".into());
