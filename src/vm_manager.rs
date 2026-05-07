@@ -134,6 +134,7 @@ impl VmManagerHandle {
 pub struct VmInfo {
     pub id: u8,
     pub name: String,
+    pub ip_address: String,
     pub status: &'static str,
 }
 
@@ -447,6 +448,7 @@ impl Drop for VmManager {
 struct VmInstance {
     id: u8,
     name: String,
+    ip_address: String,
     _vm: VmFd,
     vcpu_stopper: VcpuStopper,
     net: NetDeviceRuntime,
@@ -486,6 +488,7 @@ impl VmInstance {
         Ok(Self {
             id: config.id(),
             name: config.name().to_string(),
+            ip_address: config.guest_ip(),
             _vm: vm,
             vcpu_stopper,
             net,
@@ -620,6 +623,7 @@ impl VmInstance {
         VmInfo {
             id: self.id,
             name: self.name.clone(),
+            ip_address: self.ip_address.clone(),
             status: "running",
         }
     }

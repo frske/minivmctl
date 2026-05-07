@@ -18,6 +18,7 @@ use crate::vm_manager::{VmInfo, VmManagerHandle};
 struct VmResponse {
     id: u8,
     name: String,
+    ip_address: String,
     status: &'static str,
 }
 
@@ -121,6 +122,7 @@ impl From<VmInfo> for VmResponse {
         Self {
             id: vm.id,
             name: vm.name,
+            ip_address: vm.ip_address,
             status: vm.status,
         }
     }

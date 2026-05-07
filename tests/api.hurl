@@ -18,6 +18,7 @@ HTTP 200
 vm_1_id: jsonpath "$.id"
 [Asserts]
 jsonpath "$.name" == "web-1"
+jsonpath "$.ip_address" == "10.10.0.2"
 jsonpath "$.status" == "running"
 
 POST {{base_url}}/vms
@@ -31,6 +32,7 @@ HTTP 200
 vm_2_id: jsonpath "$.id"
 [Asserts]
 jsonpath "$.name" == "worker-1"
+jsonpath "$.ip_address" == "10.10.0.3"
 jsonpath "$.status" == "running"
 
 POST {{base_url}}/vms
@@ -44,6 +46,7 @@ HTTP 200
 vm_3_id: jsonpath "$.id"
 [Asserts]
 jsonpath "$.name" == "worker-2"
+jsonpath "$.ip_address" == "10.10.0.4"
 jsonpath "$.status" == "running"
 
 GET {{base_url}}/vms
@@ -51,12 +54,15 @@ HTTP 200
 [Asserts]
 jsonpath "$[0].id" == {{vm_1_id}}
 jsonpath "$[0].name" == "web-1"
+jsonpath "$[0].ip_address" == "10.10.0.2"
 jsonpath "$[0].status" == "running"
 jsonpath "$[1].id" == {{vm_2_id}}
 jsonpath "$[1].name" == "worker-1"
+jsonpath "$[1].ip_address" == "10.10.0.3"
 jsonpath "$[1].status" == "running"
 jsonpath "$[2].id" == {{vm_3_id}}
 jsonpath "$[2].name" == "worker-2"
+jsonpath "$[2].ip_address" == "10.10.0.4"
 jsonpath "$[2].status" == "running"
 
 DELETE {{base_url}}/vms/{{vm_2_id}}
