@@ -1,9 +1,11 @@
 use std::io;
 
 use rocket::{
-    Build, Rocket, State, delete, get,
-    http::Status,
-    post,
+    Build, Request, Response, Rocket, State, delete,
+    fairing::{Fairing, Info, Kind},
+    get,
+    http::{Header, Status},
+    options, post,
     response::status,
     routes,
     serde::{Deserialize, Serialize, json::Json},
@@ -43,7 +45,8 @@ type ApiResult<T> = Result<Json<T>, status::Custom<Json<ApiError>>>;
 pub fn rocket(handle: VmManagerHandle) -> Rocket<Build> {
     rocket::build()
         .manage(handle)
-        .mount("/", routes![list_vms, create_vm, delete_vm])
+        .attach(Cors)
+        .mount("/", routes![list_vms, create_vm, delete_vm, options])
 }
 
 #[get("/vms")]
@@ -73,6 +76,44 @@ fn delete_vm(handle: &State<VmManagerHandle>, id: u8) -> ApiResult<ApiMessage> {
     Ok(Json(ApiMessage {
         message: format!("vm {id} stop requested"),
     }))
+}
+
+#[options("/<_path..>")]
+fn options(_path: std::path::PathBuf) -> Status {
+    Status::NoContent
+}
+
+struct Cors;
+
+#[rocket::async_trait]
+impl Fairing for Cors {
+    fn info(&self) -> Info {
+        Info {
+            name: "Frontend CORS",
+            kind: Kind::Response,
+        }
+    }
+
+    async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Response<'r>) {
+        let origin = request.headers().get_one("Origin");
+        if let Some(origin) = origin.filter(|origin| is_allowed_origin(origin)) {
+            response.set_header(Header::new("Access-Control-Allow-Origin", origin));
+        }
+
+        response.set_header(Header::new(
+            "Access-Control-Allow-Methods",
+            "GET, POST, DELETE, OPTIONS",
+        ));
+        response.set_header(Header::new("Access-Control-Allow-Headers", "Content-Type"));
+        response.set_header(Header::new("Vary", "Origin"));
+    }
+}
+
+fn is_allowed_origin(origin: &str) -> bool {
+    matches!(
+        origin,
+        "http://127.0.0.1:5173" | "http://localhost:5173" | "http://0.0.0.0:5173"
+    )
 }
 
 impl From<VmInfo> for VmResponse {
