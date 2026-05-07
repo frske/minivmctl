@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VM Control</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="masthead">
+        <div>
+          <h1>Virtual Machines</h1>
+        </div>
+        <div class="toolbar">
+          <span class="endpoint">API 127.0.0.1:8000</span>
+          <button id="refresh" type="button">Refresh</button>
+        </div>
+      </header>
+
+      <section class="panel create-panel">
+        <h2>Create VM</h2>
+        <form id="create-form" class="create-form">
+          <label>
+            Name
+            <input id="name" name="name" autocomplete="off" placeholder="web-1" required />
+          </label>
+
+          <label>
+            SSH public key
+            <textarea id="ssh-key" name="ssh_key" rows="3" required></textarea>
+          </label>
+
+          <button id="create" type="submit">Create VM</button>
+        </form>
+      </section>
+
+      <p id="message" class="message" role="status"></p>
+
+      <section class="panel">
+        <h2>Running VMs</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Name</th>
+                <th>Status</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="vm-list">
+              <tr>
+                <td colspan="4" class="empty">No data loaded</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
