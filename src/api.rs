@@ -6,7 +6,7 @@ use rocket::{
     post,
     response::status,
     routes,
-    serde::{Serialize, json::Json},
+    serde::{Deserialize, Serialize, json::Json},
 };
 
 use crate::vm_manager::{VmInfo, VmManagerHandle};
@@ -15,7 +15,15 @@ use crate::vm_manager::{VmInfo, VmManagerHandle};
 #[serde(crate = "rocket::serde")]
 struct VmResponse {
     id: u8,
+    name: String,
     status: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(crate = "rocket::serde")]
+struct CreateVmRequest {
+    name: String,
+    ssh_key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -46,9 +54,14 @@ fn list_vms(handle: &State<VmManagerHandle>) -> ApiResult<Vec<VmResponse>> {
         .map_err(api_error)
 }
 
-#[post("/vms")]
-fn create_vm(handle: &State<VmManagerHandle>) -> ApiResult<VmResponse> {
-    let vm = handle.start_vm().map_err(api_error)?;
+#[post("/vms", data = "<request>")]
+fn create_vm(
+    handle: &State<VmManagerHandle>,
+    request: Json<CreateVmRequest>,
+) -> ApiResult<VmResponse> {
+    let vm = handle
+        .start_vm(request.name.clone(), request.ssh_key.clone())
+        .map_err(api_error)?;
 
     Ok(Json(VmResponse::from(vm)))
 }
@@ -66,6 +79,7 @@ impl From<VmInfo> for VmResponse {
     fn from(vm: VmInfo) -> Self {
         Self {
             id: vm.id,
+            name: vm.name,
             status: vm.status,
         }
     }

@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    fs,
     fs::OpenOptions,
     io,
     path::PathBuf,
@@ -41,12 +40,13 @@ const COMMAND_TOKEN: u8 = 0;
 const KERNEL_PATH: &str = "/home/frsk/prj/kernel_images/linux-6.6.99/vmlinux";
 const MMIO_MEM_START: u64 = 0xd0000000;
 const QUEUE_NOTIFY_OFFSET: u64 = 0x50;
-const SSH_KEY_PATH: &str = "/home/frsk/.ssh/id_ed25519.pub";
 const VM_STOP_SIGNAL: libc::c_int = libc::SIGUSR1;
 static STOP_SIGNAL_HANDLER_RESULT: OnceLock<Result<(), i32>> = OnceLock::new();
 
 enum VmCommand {
     Start {
+        name: String,
+        ssh_key: String,
         response: mpsc::Sender<VmManagerResult<VmInfo>>,
     },
     List {
@@ -75,11 +75,15 @@ impl Clone for VmManagerHandle {
 }
 
 impl VmManagerHandle {
-    pub fn start_vm(&self) -> VmManagerResult<VmInfo> {
+    pub fn start_vm(&self, name: String, ssh_key: String) -> VmManagerResult<VmInfo> {
         self.send_command(
             "vm manager is not running",
             Duration::from_secs(120),
-            |response| VmCommand::Start { response },
+            |response| VmCommand::Start {
+                name,
+                ssh_key,
+                response,
+            },
         )
     }
 
@@ -129,6 +133,7 @@ impl VmManagerHandle {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmInfo {
     pub id: u8,
+    pub name: String,
     pub status: &'static str,
 }
 
@@ -150,11 +155,21 @@ struct EventRoute {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmConfig {
     id: u8,
+    name: String,
+    ssh_key: String,
 }
 
 impl VmConfig {
     pub fn id(&self) -> u8 {
         self.id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn ssh_key(&self) -> &str {
+        &self.ssh_key
     }
 
     pub fn tap_name(&self) -> String {
@@ -283,8 +298,12 @@ impl VmManager {
 
         while let Ok(command) = self.command_rx.try_recv() {
             match command {
-                VmCommand::Start { response } => {
-                    let config = self.vm_config();
+                VmCommand::Start {
+                    name,
+                    ssh_key,
+                    response,
+                } => {
+                    let config = self.vm_config(name, ssh_key);
                     let _ = response.send(self.start_vm(config, poll, routes, next_token_count));
                 }
                 VmCommand::List { response } => {
@@ -328,9 +347,11 @@ impl VmManager {
         id
     }
 
-    fn vm_config(&mut self) -> VmConfig {
+    fn vm_config(&mut self, name: String, ssh_key: String) -> VmConfig {
         VmConfig {
             id: self.next_avail_id(),
+            name,
+            ssh_key,
         }
     }
 
@@ -425,6 +446,7 @@ impl Drop for VmManager {
 
 struct VmInstance {
     id: u8,
+    name: String,
     _vm: VmFd,
     vcpu_stopper: VcpuStopper,
     net: NetDeviceRuntime,
@@ -463,6 +485,7 @@ impl VmInstance {
 
         Ok(Self {
             id: config.id(),
+            name: config.name().to_string(),
             _vm: vm,
             vcpu_stopper,
             net,
@@ -474,8 +497,7 @@ impl VmInstance {
 
     fn provision_vm(config: &VmConfig) {
         provision::provision_vm_host(config.id()).expect("failed to provision host");
-        let public_ssh_key = fs::read_to_string(SSH_KEY_PATH).expect("failed to read SSH key");
-        provision::provision_guest(config.id(), public_ssh_key.trim_end())
+        provision::provision_guest(config.id(), config.ssh_key().trim_end())
             .expect("failed to provision guest");
 
         println!(
@@ -597,6 +619,7 @@ impl VmInstance {
     fn info(&self) -> VmInfo {
         VmInfo {
             id: self.id,
+            name: self.name.clone(),
             status: "running",
         }
     }
@@ -920,7 +943,11 @@ mod tests {
     use std::{collections::HashMap, io::ErrorKind};
 
     fn test_config(id: u8) -> VmConfig {
-        VmConfig { id }
+        VmConfig {
+            id,
+            name: format!("vm-{id}"),
+            ssh_key: "ssh-ed25519 test".to_string(),
+        }
     }
 
     #[test]
@@ -1026,7 +1053,9 @@ mod tests {
         let manager = VmManager::new();
         let handle = manager.handle().unwrap();
 
-        let err = handle.start_vm().unwrap_err();
+        let err = handle
+            .start_vm("test-vm".to_string(), "ssh-ed25519 test".to_string())
+            .unwrap_err();
 
         assert_eq!(
             err.downcast_ref::<io::Error>().unwrap().kind(),
