@@ -169,6 +169,58 @@ button.danger:hover:not(:disabled) {
   background: #fff;
 }
 
+button.copy-ip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 13px;
+  font-weight: 650;
+  padding: 0;
+}
+
+.copy-symbol {
+  width: 17px;
+  height: 17px;
+  color: var(--muted);
+  fill: none;
+  stroke: currentcolor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+button.copy-ip:hover:not(:disabled) {
+  background: transparent;
+  color: var(--text);
+}
+
+button.copy-ip:hover:not(:disabled) .copy-symbol {
+  color: var(--accent);
+}
+
+button.copy-ip.copied .copy-symbol {
+  animation: copy-pop 650ms ease;
+  color: var(--success);
+}
+
+@keyframes copy-pop {
+  0% {
+    transform: scale(1);
+  }
+
+  35% {
+    transform: scale(1.28);
+  }
+
+  100% {
+    transform: scale(1);
+  }
+}
+
 .message {
   display: none;
   margin: 14px 0;
@@ -231,9 +283,13 @@ tr:last-child td {
 
 .status {
   color: var(--success);
+  font-weight: 700;
+}
+
+.mono,
+.status {
   font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
   font-size: 13px;
-  font-weight: 700;
 }
 
 .empty {

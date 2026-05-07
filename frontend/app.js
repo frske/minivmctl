@@ -47,7 +47,7 @@ function setMessage(text, kind = "") {
 
 function renderVms(vms) {
   if (vms.length === 0) {
-    vmList.innerHTML = '<tr><td colspan="4" class="empty">No VMs running</td></tr>';
+    vmList.innerHTML = '<tr><td colspan="5" class="empty">No VMs running</td></tr>';
     return;
   }
 
@@ -57,6 +57,15 @@ function renderVms(vms) {
       row.innerHTML = `
         <td>${vm.id}</td>
         <td>${escapeHtml(vm.name)}</td>
+        <td>
+          <button class="copy-ip" type="button" data-ip="${escapeHtml(vm.ip_address)}" title="Copy IP address">
+            <span>${escapeHtml(vm.ip_address)}</span>
+            <svg class="copy-symbol" aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M8 8V5.75C8 4.78 8.78 4 9.75 4h8.5C19.22 4 20 4.78 20 5.75v8.5c0 .97-.78 1.75-1.75 1.75H16" />
+              <path d="M5.75 8h8.5c.97 0 1.75.78 1.75 1.75v8.5c0 .97-.78 1.75-1.75 1.75h-8.5C4.78 20 4 19.22 4 18.25v-8.5C4 8.78 4.78 8 5.75 8Z" />
+            </svg>
+          </button>
+        </td>
         <td><span class="status">${escapeHtml(vm.status)}</span></td>
         <td><button class="danger" type="button" data-id="${vm.id}">Delete</button></td>
       `;
@@ -115,6 +124,18 @@ sshKeyInput.addEventListener("input", () => {
 refreshButton.addEventListener("click", loadVms);
 
 vmList.addEventListener("click", async (event) => {
+  const copyButton = event.target.closest("button[data-ip]");
+  if (copyButton) {
+    try {
+      await copyText(copyButton.dataset.ip);
+      animateCopy(copyButton);
+      setMessage(`Copied ${copyButton.dataset.ip}.`, "ok");
+    } catch (error) {
+      setMessage("Could not copy IP address.", "error");
+    }
+    return;
+  }
+
   const button = event.target.closest("button[data-id]");
   if (!button) return;
 
@@ -129,5 +150,34 @@ vmList.addEventListener("click", async (event) => {
     setBusy(false);
   }
 });
+
+function animateCopy(button) {
+  button.classList.remove("copied");
+  void button.offsetWidth;
+  button.classList.add("copied");
+  window.setTimeout(() => button.classList.remove("copied"), 650);
+}
+
+async function copyText(text) {
+  if (navigator.clipboard) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  document.body.append(textarea);
+  textarea.select();
+
+  try {
+    if (!document.execCommand("copy")) {
+      throw new Error("copy command failed");
+    }
+  } finally {
+    textarea.remove();
+  }
+}
 
 loadVms();
