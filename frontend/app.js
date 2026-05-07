@@ -59,7 +59,7 @@ function renderVms(vms) {
         <td>${escapeHtml(vm.name)}</td>
         <td>
           <button class="copy-ip" type="button" data-ip="${escapeHtml(vm.ip_address)}" title="Copy IP address">
-            <span>${escapeHtml(vm.ip_address)}</span>
+            <span class="copy-ip-text">${escapeHtml(vm.ip_address)}</span>
             <svg class="copy-symbol" aria-hidden="true" viewBox="0 0 24 24">
               <path d="M8 8V5.75C8 4.78 8.78 4 9.75 4h8.5C19.22 4 20 4.78 20 5.75v8.5c0 .97-.78 1.75-1.75 1.75H16" />
               <path d="M5.75 8h8.5c.97 0 1.75.78 1.75 1.75v8.5c0 .97-.78 1.75-1.75 1.75h-8.5C4.78 20 4 19.22 4 18.25v-8.5C4 8.78 4.78 8 5.75 8Z" />
@@ -152,10 +152,24 @@ vmList.addEventListener("click", async (event) => {
 });
 
 function animateCopy(button) {
+  const text = button.querySelector(".copy-ip-text");
   button.classList.remove("copied");
   void button.offsetWidth;
   button.classList.add("copied");
-  window.setTimeout(() => button.classList.remove("copied"), 650);
+  if (text?.animate) {
+    text.animate(
+      [
+        { transform: "perspective(600px) translateY(0) rotateX(0deg)", color: "var(--text)" },
+        { transform: "perspective(600px) translateY(-0.5px) rotateX(10deg)", color: "var(--success)" },
+        { transform: "perspective(600px) translateY(0) rotateX(0deg)", color: "var(--success)" },
+      ],
+      {
+        duration: 420,
+        easing: "ease-out",
+      },
+    );
+  }
+  window.setTimeout(() => button.classList.remove("copied"), 420);
 }
 
 async function copyText(text) {

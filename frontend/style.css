@@ -182,6 +182,12 @@ button.copy-ip {
   padding: 0;
 }
 
+button.copy-ip > .copy-ip-text {
+  display: inline-block;
+  transform-origin: left center;
+  backface-visibility: hidden;
+}
+
 .copy-symbol {
   width: 17px;
   height: 17px;
@@ -202,23 +208,17 @@ button.copy-ip:hover:not(:disabled) .copy-symbol {
   color: var(--accent);
 }
 
-button.copy-ip.copied .copy-symbol {
-  animation: copy-pop 650ms ease;
+button.copy-ip.copied > .copy-ip-text,
+button.copy-ip.copied:hover:not(:disabled) > .copy-ip-text {
   color: var(--success);
 }
 
-@keyframes copy-pop {
-  0% {
-    transform: scale(1);
-  }
+button.copy-ip.copied .copy-symbol {
+  color: var(--muted);
+}
 
-  35% {
-    transform: scale(1.28);
-  }
-
-  100% {
-    transform: scale(1);
-  }
+button.copy-ip.copied:hover:not(:disabled) .copy-symbol {
+  color: var(--muted);
 }
 
 .message {
