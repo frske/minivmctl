@@ -1,4 +1,4 @@
-use std::{cell::RefCell, io, mem::zeroed, ops::Deref, os::fd::AsRawFd, rc::Rc};
+use std::{cell::RefCell, io, ops::Deref, os::fd::AsRawFd, rc::Rc};
 
 use slab::Slab;
 use vm_superio::Trigger;
@@ -51,7 +51,7 @@ impl<T> EventLoop<T> {
         let epoll = Rc::new(Epoll::new()?);
         Ok(Self {
             epoll,
-            events: vec![unsafe { zeroed() }; size],
+            events: vec![EpollEvent::new(EventSet::empty(), 0); size],
             callbacks: Rc::new(RefCell::new(Slab::new())),
         })
     }
@@ -59,17 +59,21 @@ impl<T> EventLoop<T> {
     pub fn register(&mut self, fd: &impl AsRawFd, event: EventSet, callback: T) -> io::Result<()> {
         let fd = fd.as_raw_fd();
         let user_data = self.callbacks.borrow_mut().insert(callback);
-        self.epoll
-            .ctl(
-                ControlOperation::Add,
-                fd,
-                EpollEvent::new(event, user_data as u64),
-            )
-            .map_err(|e| {
-                let _ = self.callbacks.borrow_mut().remove(user_data);
-                e
-            })?;
+        if let Err(e) = self.add_epoll_entry(fd, event, user_data) {
+            self.callbacks.borrow_mut().remove(user_data);
+            return Err(e);
+        }
         Ok(())
+    }
+
+    fn add_epoll_entry(
+        &self,
+        fd: libc::c_int,
+        event: EventSet,
+        user_data: usize,
+    ) -> io::Result<()> {
+        self.epoll
+            .ctl(ControlOperation::Add, fd, EpollEvent::new(event, user_data as u64))
     }
 }
 
@@ -86,11 +90,13 @@ where
     T: EventHandlerMut,
 {
     pub fn tick(&mut self, timeout: i32) -> io::Result<usize> {
-        let n = self.epoll.wait(timeout, &mut self.events[..])?;
-        for event in self.events.iter().take(n) {
-            self.callbacks.borrow_mut()[event.data() as usize].handle_event_mut(event.event_set());
+        let num_events = self.epoll.wait(timeout, &mut self.events[..])?;
+        let mut callbacks = self.callbacks.borrow_mut();
+        for event in self.events.iter().take(num_events) {
+            let index = event.data() as usize;
+            callbacks[index].handle_event_mut(event.event_set());
         }
-        Ok(n)
+        Ok(num_events)
     }
 }
 
@@ -115,16 +121,14 @@ impl<T> EventLoop<T> {
 impl<T> PreRegister<T> {
     pub fn associate(&self, fd: &impl AsRawFd, event: EventSet) -> io::Result<()> {
         let fd = fd.as_raw_fd();
-        self.epoll
-            .ctl(
-                ControlOperation::Add,
-                fd,
-                EpollEvent::new(event, self.user_data as u64),
-            )
-            .map_err(|e| {
-                let _ = self.callbacks.borrow_mut().remove(self.user_data);
-                e
-            })?;
+        if let Err(e) = self.epoll.ctl(
+            ControlOperation::Add,
+            fd,
+            EpollEvent::new(event, self.user_data as u64),
+        ) {
+            self.callbacks.borrow_mut().remove(self.user_data);
+            return Err(e);
+        }
         Ok(())
     }
 }
