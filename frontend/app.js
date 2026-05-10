@@ -1,4 +1,4 @@
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE = "https://127.0.0.1:8443";
 const SSH_KEY_STORAGE_KEY = "scratch.vm.sshPublicKey";
 
 const form = document.querySelector("#create-form");
