@@ -13,6 +13,13 @@ use linux_loader::{
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 pub const MEMORY_SIZE: usize = 512 << 20;
+
+const PTE_PRESENT: u64 = 0x1;
+const PTE_WRITABLE: u64 = 0x2;
+const PTE_HUGE_PAGE: u64 = 0x80;
+const PTE_PRESENT_WRITABLE: u64 = PTE_PRESENT | PTE_WRITABLE;
+const PTE_PRESENT_WRITABLE_HUGE: u64 = PTE_PRESENT | PTE_WRITABLE | PTE_HUGE_PAGE;
+
 pub const BOOT_GDT_OFFSET: u64 = 0x500;
 pub const X86_CR0_PG: u64 = 0x80000000;
 pub const X86_CR4_PAE: u64 = 0x20;
@@ -113,14 +120,14 @@ pub fn write_page_tables(
 ) {
     guest_mem
         .write_slice(
-            &(boot_pdpte_addr.raw_value() as u64 | 1).to_le_bytes(),
+            &(boot_pdpte_addr.raw_value() | PTE_PRESENT).to_le_bytes(),
             boot_pml4_addr,
         )
         .unwrap();
 
     guest_mem
         .write_slice(
-            &(boot_pde_addr.raw_value() as u64 | 0b11).to_le_bytes(),
+            &(boot_pde_addr.raw_value() | PTE_PRESENT_WRITABLE).to_le_bytes(),
             boot_pdpte_addr,
         )
         .unwrap();
@@ -128,7 +135,7 @@ pub fn write_page_tables(
     for i in 0..512 {
         guest_mem
             .write_slice(
-                &((i << 21) | 0b10000011u64).to_le_bytes(),
+                &((i << 21) | PTE_PRESENT_WRITABLE_HUGE).to_le_bytes(),
                 boot_pde_addr.unchecked_add(i * 8),
             )
             .unwrap()
@@ -176,7 +183,7 @@ pub fn configure_segments_and_paging(
     sregs.gs = data_seg;
     sregs.ss = data_seg;
 
-    sregs.cr3 = boot_pml4_addr.raw_value() as u64;
+    sregs.cr3 = boot_pml4_addr.raw_value();
     sregs.cr4 |= X86_CR4_PAE;
     sregs.cr0 |= X86_CR0_PE | X86_CR0_PG;
     sregs.efer |= EFER_LMA | EFER_LME;
@@ -233,34 +240,29 @@ pub fn write_boot_params(guest_mem: &GuestMemoryMmap<()>) {
     params.hdr.kernel_alignment = KERNEL_MIN_ALIGNMENT_BYTES;
 
     add_e820_entry(&mut params, 0, EBDA_START, E820_RAM);
+
     let last_addr = guest_mem.last_addr();
     let first_addr_past_32bits = GuestAddress(FIRST_ADDR_PAST_32BITS);
     let end_32bit_gap_start = GuestAddress(MMIO_MEM_START);
     let himem_start = GuestAddress(HIMEM_START);
 
-    if last_addr < end_32bit_gap_start {
-        add_e820_entry(
-            &mut params,
-            himem_start.raw_value() as u64,
-            last_addr.unchecked_offset_from(himem_start) as u64 + 1,
-            E820_RAM,
-        );
-    } else {
-        add_e820_entry(
-            &mut params,
-            himem_start.raw_value() as u64,
-            end_32bit_gap_start.unchecked_offset_from(himem_start),
-            E820_RAM,
-        );
+    let himem_raw = himem_start.raw_value();
+    let gap_size = end_32bit_gap_start.unchecked_offset_from(himem_start);
+    add_e820_entry(&mut params, himem_raw, gap_size, E820_RAM);
 
-        if last_addr > first_addr_past_32bits {
-            add_e820_entry(
-                &mut params,
-                first_addr_past_32bits.raw_value(),
-                last_addr.unchecked_offset_from(first_addr_past_32bits) + 1,
-                E820_RAM,
-            );
-        }
+    if last_addr > first_addr_past_32bits {
+        let high_mem_size = last_addr.unchecked_offset_from(first_addr_past_32bits) + 1;
+        add_e820_entry(
+            &mut params,
+            first_addr_past_32bits.raw_value(),
+            high_mem_size,
+            E820_RAM,
+        );
+    }
+
+    if last_addr < end_32bit_gap_start {
+        let extended_size = last_addr.unchecked_offset_from(himem_start) as u64 + 1;
+        params.e820_table[params.e820_entries as usize - 1].size = extended_size;
     }
 
     LinuxBootConfigurator::write_bootparams(
@@ -291,28 +293,33 @@ pub const fn seg_with_st(selector_index: u16, type_: u8) -> kvm_segment {
 pub const fn to_gdt_entry(seg: &kvm_segment) -> u64 {
     let base = seg.base;
     let limit = seg.limit as u64;
-    let flags = (seg.g as u64 & 0x1) << 3
-        | (seg.db as u64 & 0x1) << 2
-        | (seg.l as u64 & 0x1) << 1
-        | (seg.avl as u64 & 0x1);
-    let access = (seg.present as u64 & 0x1) << 7
-        | (seg.dpl as u64 & 0x11) << 5
-        | (seg.s as u64 & 0x1) << 4
-        | (seg.type_ as u64 & 0x1111);
+
+    let limit_high = (limit >> 16) & 0xf;
+    let flag_bits = ((seg.g as u64) << 3)
+        | ((seg.db as u64) << 2)
+        | ((seg.l as u64) << 1)
+        | (seg.avl as u64);
+    let upper_byte = (limit_high << 8) | flag_bits;
+
+    let access_byte = ((seg.present as u64) << 7)
+        | ((seg.dpl as u64) << 5)
+        | ((seg.s as u64) << 4)
+        | (seg.type_ as u64);
+
     ((base & 0xff00_0000u64) << 32)
         | ((base & 0x00ff_ffffu64) << 16)
-        | (limit & 0x0000_ffffu64)
-        | ((limit & 0x000f_0000u64) << 32)
-        | (flags << 52)
-        | (access << 40)
+        | (limit & 0xffff)
+        | (access_byte << 40)
+        | (upper_byte << 48)
 }
 
 pub fn add_e820_entry(params: &mut boot_params, addr: u64, size: u64, mem_type: u32) {
     if params.e820_entries >= params.e820_table.len() as u8 {
         panic!();
     }
-    params.e820_table[params.e820_entries as usize].addr = addr;
-    params.e820_table[params.e820_entries as usize].size = size;
-    params.e820_table[params.e820_entries as usize].type_ = mem_type;
+    let entry = &mut params.e820_table[params.e820_entries as usize];
+    entry.addr = addr;
+    entry.size = size;
+    entry.type_ = mem_type;
     params.e820_entries += 1;
 }
