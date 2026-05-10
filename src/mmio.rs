@@ -2,6 +2,8 @@ const MMIO_MAGIC_VALUE: u32 = 0x7472_6976;
 const MMIO_VERSION: u32 = 2;
 const VENDOR_ID: u32 = 0;
 
+const CONFIG_SPACE_OFFSET: u64 = 0x100;
+
 use std::{
     num::Wrapping,
     sync::{
@@ -91,7 +93,6 @@ impl MMIOTransport {
         (self.device_status & set) == set && (self.device_status & clear) == 0
     }
 
-    #[inline]
     fn update_queue_field<F>(&mut self, f: F)
     where
         F: FnOnce(&mut Queue),
@@ -107,61 +108,71 @@ impl MMIOTransport {
     fn set_device_status(&mut self, status: u32) {
         use device_status::*;
 
-        let missing_bits = status & !self.device_status;
+        let newly_set = status & !self.device_status;
 
-        match missing_bits {
-            ACKNOWLEDGE if self.device_status == INIT => self.device_status = status,
-            DRIVER if self.device_status == ACKNOWLEDGE => self.device_status = status,
+        match newly_set {
+            ACKNOWLEDGE if self.device_status == INIT => {
+                self.device_status = status;
+            }
+            DRIVER if self.device_status == ACKNOWLEDGE => {
+                self.device_status = status;
+            }
             FEATURES_OK if self.device_status == (ACKNOWLEDGE | DRIVER) => {
                 self.device_status = status;
             }
             DRIVER_OK if self.device_status == (ACKNOWLEDGE | DRIVER | FEATURES_OK) => {
                 self.device_status = status;
-                let mut locked_device = self.device.lock().unwrap();
-                if !locked_device.is_activated()
-                    && locked_device
-                        .queues()
-                        .iter()
-                        .all(|q: &Queue| q.is_valid(&self.mem))
-                    && locked_device.activate(self.mem.clone()).is_err()
-                {
-                    self.device_status |= DEVICE_NEEDS_RESET;
-
-                    let _ = locked_device.interrupt_trigger().trigger(); //there was a trigger type here IrqType::Config
-                    //no clue what is supposed ot happen here, probably just trigger() with no type+
-                }
+                self.try_activate_device();
             }
             _ if (status & FAILED) != 0 => {
+                self.device_status |= device_status::FAILED;
                 // todo: notify backend driver to stop the device
-                self.device_status |= FAILED
             }
-
             _ if status == 0 => {
-                let mut locked_device = self.device.lock().unwrap();
-                if locked_device.is_activated() && locked_device.reset().is_none() {
-                    self.device_status |= FAILED;
-                }
-
-                if self.device_status & FAILED == 0 {
-                    self.features_select = 0;
-                    self.acked_features_select = 0;
-                    self.queue_select = 0;
-                    self.interrupt_status.store(0, Ordering::SeqCst);
-                    self.device_status = device_status::INIT;
-
-                    for queue in locked_device.queues_mut() {
-                        *queue = Queue::new(queue.max_size)
-                    }
-                }
+                self.reset_or_fail();
             }
             _ => (),
         }
     }
 
+    fn try_activate_device(&mut self) {
+        let mut device = self.device.lock().unwrap();
+        if device.is_activated() {
+            return;
+        }
+        let all_queues_valid = device.queues().iter().all(|q| q.is_valid(&self.mem));
+        if !all_queues_valid {
+            return;
+        }
+        if device.activate(self.mem.clone()).is_err() {
+            self.device_status |= device_status::DEVICE_NEEDS_RESET;
+            let _ = device.interrupt_trigger().trigger(); //there was a trigger type here IrqType::Config
+            //no clue what is supposed ot happen here, probably just trigger() with no type+
+        }
+    }
+
+    fn reset_or_fail(&mut self) {
+        let mut device = self.device.lock().unwrap();
+        if device.is_activated() && device.reset().is_none() {
+            self.device_status |= device_status::FAILED;
+        }
+        if self.device_status & device_status::FAILED == 0 {
+            self.features_select = 0;
+            self.acked_features_select = 0;
+            self.queue_select = 0;
+            self.interrupt_status.store(0, Ordering::SeqCst);
+            self.device_status = device_status::INIT;
+
+            for queue in device.queues_mut() {
+                *queue = Queue::new(queue.max_size);
+            }
+        }
+    }
+
     pub fn bus_read(&mut self, offset: u64, data: &mut [u8]) {
-        if offset <= 0xff && data.len() == 4 {
+        if offset <= 0xff && data.len() == std::mem::size_of::<u32>() {
             let v = match offset {
-                0x0 => MMIO_MAGIC_VALUE,
+                0x00 => MMIO_MAGIC_VALUE,
                 0x04 => MMIO_VERSION,
                 0x08 => self.device.lock().unwrap().device_type(),
                 0x0c => VENDOR_ID,
@@ -176,11 +187,11 @@ impl MMIOTransport {
                 }
             };
             data.copy_from_slice(v.to_le_bytes().as_slice());
-        } else if (offset >= 0x100) && (offset <= 0xfff) {
+        } else if offset >= CONFIG_SPACE_OFFSET && offset <= 0xfff {
             self.device
                 .lock()
                 .unwrap()
-                .read_config((offset - 0x100) as u32, data);
+                .read_config((offset - CONFIG_SPACE_OFFSET) as u32, data);
         }
     }
 
@@ -197,7 +208,7 @@ impl MMIOTransport {
             *v = (*v & !0xffff_ffff) | u64::from(x)
         }
 
-        if offset <= 0xff && data.len() == 4 {
+        if offset <= 0xff && data.len() == std::mem::size_of::<u32>() {
             let mut buf: [u8; 4] = [0; 4];
             buf.copy_from_slice(data);
             let v = u32::from_le_bytes(buf);
@@ -234,7 +245,7 @@ impl MMIOTransport {
                 0xa4 => self.update_queue_field(|q| set_high32(&mut q.used_ring, v)),
                 _ => {}
             }
-        } else if offset >= 0x100 && offset <= 0xfff {
+        } else if offset >= CONFIG_SPACE_OFFSET && offset <= 0xfff {
             if self.check_device_status(
                 device_status::DRIVER,
                 device_status::FAILED | device_status::DEVICE_NEEDS_RESET,
@@ -242,7 +253,7 @@ impl MMIOTransport {
                 self.device
                     .lock()
                     .unwrap()
-                    .write_config((offset - 0x100) as u32, data);
+                    .write_config((offset - CONFIG_SPACE_OFFSET) as u32, data);
                 self.config_generation += 1;
             }
         }
