@@ -12,6 +12,19 @@ use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, Gu
 use vm_superio::Trigger;
 use vmm_sys_util::eventfd::EventFd;
 
+const VIRTQ_DESC_F_NEXT: u16 = 0x1;
+const VIRTQ_DESC_F_WRITE: u16 = 0x2;
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct Descriptor {
+    addr: u64,
+    len: u32,
+    flags: u16,
+    next: u16,
+}
+unsafe impl ByteValued for Descriptor {}
+
 #[derive(Clone)]
 pub struct DescriptorChain<M> {
     pub(crate) mem: M,
@@ -38,19 +51,8 @@ where
         Ok(Self::new_unchecked(mem, desc_table, queue_size, index))
     }
 
-    #[inline(always)]
     pub fn new_unchecked(mem: M, desc_table: GuestAddress, queue_size: u16, index: u16) -> Self {
-        #[repr(C)]
-        #[derive(Default, Clone, Copy)]
-        struct Descriptor {
-            addr: u64,
-            len: u32,
-            flags: u16,
-            next: u16,
-        }
-        unsafe impl ByteValued for Descriptor {}
-
-        let addr = desc_table.unchecked_add((index as u64) * 16);
+        let addr = desc_table.unchecked_add(u64::from(index) * std::mem::size_of::<Descriptor>() as u64);
         let desc = mem.read_obj::<Descriptor>(addr).unwrap();
 
         Self {
@@ -69,27 +71,21 @@ where
     where
         M: Clone,
     {
-        const VIRTQ_DESC_F_NEXT: u16 = 0x1;
-        if self.flags & VIRTQ_DESC_F_NEXT != 0 {
-            Self::new(
-                self.mem.clone(),
-                self.desc_table,
-                self.queue_size,
-                self.next,
-            )
-            .ok()
+        if self.has_next() {
+            Self::new(self.mem.clone(), self.desc_table, self.queue_size, self.next).ok()
         } else {
             None
         }
     }
 
-    #[inline]
+    const fn has_next(&self) -> bool {
+        self.flags & VIRTQ_DESC_F_NEXT != 0
+    }
+
     pub const fn is_write_only(&self) -> bool {
-        const VIRTQ_DESC_F_WRITE: u16 = 0x2;
         self.flags & VIRTQ_DESC_F_WRITE != 0
     }
 
-    #[inline]
     pub fn write_at(self, mut offset: usize, mut data: &[u8]) -> io::Result<()>
     where
         M: Clone,
@@ -158,22 +154,29 @@ impl Queue {
         &mut self,
         mem: M,
     ) -> Result<Option<DescriptorChain<M>>, ()> {
-        macro_rules! try_pop {
-            () => {
-                if self.len(mem.deref()) != 0 {
-                    return self.pop_unchecked(mem).map(Option::Some);
-                }
-            };
-        }
         fence(Ordering::Acquire);
-        try_pop!();
-        if self.notif_suppress {
-            let avail_event_addr = self.used_ring.unchecked_add(((self.size as u64) << 3) + 4);
-            mem.write_obj(self.next_avail.0, avail_event_addr).unwrap();
-            fence(Ordering::AcqRel);
-            try_pop!();
+        if self.has_pending_entries(&mem) {
+            return self.pop_unchecked(mem).map(Some);
         }
+
+        if self.notif_suppress {
+            self.write_avail_event(&mem);
+            fence(Ordering::AcqRel);
+            if self.has_pending_entries(&mem) {
+                return self.pop_unchecked(mem).map(Some);
+            }
+        }
+
         Ok(None)
+    }
+
+    fn has_pending_entries<M: Deref<Target = impl GuestMemoryBackend>>(&self, mem: &M) -> bool {
+        self.len(mem.deref()) != 0
+    }
+
+    fn write_avail_event<M: Deref<Target = impl GuestMemoryBackend>>(&self, mem: &M) {
+        let avail_event_addr = self.used_ring.unchecked_add((u64::from(self.size) << 3) + 4);
+        mem.deref().write_obj(self.next_avail.0, avail_event_addr).unwrap();
     }
 
     pub fn push<M: GuestMemoryBackend>(&mut self, mem: &M, desc_index: u16, len: u32) {
@@ -184,9 +187,10 @@ impl Queue {
             len: u32,
         }
         unsafe impl ByteValued for UsedElem {}
+
         let addr = self
             .used_ring
-            .unchecked_add((((self.next_used.0 % self.size) as u64) << 3) + 4);
+            .unchecked_add((u64::from(self.next_used.0 % self.size) << 3) + 4);
         mem.write_obj(
             UsedElem {
                 id: desc_index as u32,
@@ -198,7 +202,8 @@ impl Queue {
         self.num_added += 1;
         self.next_used += 1;
         fence(Ordering::Release);
-        mem.write_obj(self.next_used.0, self.used_ring.unchecked_add(2))
+        let used_idx_addr = self.used_ring.unchecked_add(2);
+        mem.write_obj(self.next_used.0, used_idx_addr)
             .unwrap();
     }
 
@@ -211,7 +216,7 @@ impl Queue {
             return mem.read_obj::<u16>(self.avail_ring).unwrap() == 0;
         }
         fence(Ordering::AcqRel);
-        let used_event_addr = self.avail_ring.unchecked_add(((self.size as u64) << 1) + 4);
+        let used_event_addr = self.avail_ring.unchecked_add((u64::from(self.size) << 1) + 4);
         let used_event = Wrapping(mem.read_obj::<u16>(used_event_addr).unwrap());
         let num_added = self.num_added;
         self.num_added = Wrapping(0);
@@ -219,43 +224,21 @@ impl Queue {
     }
 
     pub fn is_valid<M: GuestMemoryBackend>(&self, mem: &M) -> bool {
-        if !self.ready {
-            return false;
-        }
-        if self.size > self.max_size {
-            return false;
-        }
-        if self.size == 0 || self.size & (self.size - 1) != 0 || self.size > 32768 {
-            return false;
-        }
-        if self.desc_table.raw_value() & 0xf != 0 {
-            return false;
-        }
-        if self.avail_ring.raw_value() & 0x3 != 0 {
-            return false;
-        }
-        if self.used_ring.raw_value() & 0x1 != 0 {
-            return false;
-        }
-        if mem
-            .get_slice(self.desc_table, (self.size as usize) << 4)
-            .is_err()
-        {
-            return false;
-        }
-        if mem
-            .get_slice(self.avail_ring, ((self.size as usize) * 2) + 6)
-            .is_err()
-        {
-            return false;
-        }
-        if mem
-            .get_slice(self.used_ring, ((self.size as usize) * 8) + 6)
-            .is_err()
-        {
-            return false;
-        }
-        true
+        self.ready
+            && self.size <= self.max_size
+            && self.size != 0
+            && self.size.is_power_of_two()
+            && self.size <= 32768
+            && self.desc_table.raw_value() % 16 == 0
+            && self.avail_ring.raw_value() % 4 == 0
+            && self.used_ring.raw_value() % 2 == 0
+            && self.region_accessible(mem, self.desc_table, self.size as usize * 16)
+            && self.region_accessible(mem, self.avail_ring, self.size as usize * 2 + 6)
+            && self.region_accessible(mem, self.used_ring, self.size as usize * 8 + 6)
+    }
+
+    fn region_accessible<M: GuestMemoryBackend>(&self, mem: &M, addr: GuestAddress, len: usize) -> bool {
+        mem.get_slice(addr, len).is_ok()
     }
 
     fn pop_unchecked<M: Deref<Target = impl GuestMemoryBackend>>(
@@ -264,26 +247,22 @@ impl Queue {
     ) -> Result<DescriptorChain<M>, ()> {
         let addr = self
             .avail_ring
-            .unchecked_add((((self.next_avail.0 % self.size) as u64) * 2) + 4);
+            .unchecked_add((u64::from(self.next_avail.0 % self.size) * 2) + 4);
         let desc_index = mem.read_obj::<u16>(addr).unwrap();
         let desc_chain = DescriptorChain::new(mem, self.desc_table, self.size, desc_index);
-        if desc_chain.is_ok() {
-            self.next_avail += 1;
-        } else {
-            eprintln!("pop failed because invalid desc index");
+        if desc_chain.is_err() {
+            return desc_chain;
         }
+        self.next_avail += 1;
         desc_chain
     }
 
-    #[inline(always)]
     fn avail_idx<M: GuestMemoryBackend>(&self, mem: &M) -> Wrapping<u16> {
         Wrapping(
-            mem.read_obj::<u16>(self.avail_ring.unchecked_add(2))
-                .unwrap(),
+            mem.read_obj::<u16>(self.avail_ring.unchecked_add(2)).unwrap(),
         )
     }
 
-    #[inline(always)]
     fn len<M: GuestMemoryBackend>(&self, mem: &M) -> u16 {
         (self.avail_idx(mem) - self.next_avail).0
     }
