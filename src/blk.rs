@@ -19,6 +19,9 @@ const VIRTIO_TYPE_BLOCK: u32 = 2;
 const SECTOR_SHIFT: u8 = 9;
 const SECTOR_SIZE: u64 = 1 << SECTOR_SHIFT;
 
+const IRQ_BIT_VRING: u32 = 0x1;
+const IRQ_BIT_CONFIG: u32 = 0x2;
+
 const VIRTIO_BLK_T_IN: u32 = 0;
 const VIRTIO_BLK_T_OUT: u32 = 1;
 const VIRTIO_BLK_T_FLUSH: u32 = 4;
@@ -37,10 +40,6 @@ enum RequestType {
     Out,
     Flush,
     Unsupported(u32),
-}
-
-fn test(  ) {
-    println!("jsjdjsj");
 }
 
 impl From<u32> for RequestType {
@@ -294,8 +293,8 @@ impl IrqTrigger {
 
     fn trigger(&self, irq_type: IrqType) -> io::Result<()> {
         let bit = match irq_type {
-            IrqType::Config => 0x2,
-            IrqType::Vring => 0x1,
+            IrqType::Config => IRQ_BIT_CONFIG,
+            IrqType::Vring => IRQ_BIT_VRING,
         };
         self.irq_status.fetch_or(bit, Ordering::SeqCst);
         self.irq_evt.write(1)
@@ -341,10 +340,10 @@ impl DeviceState {
         matches!(self, Self::Activated { .. })
     }
 
-    fn unwrap(&self) -> GuestMemoryMmap {
+    fn activated_mem(&self) -> Option<GuestMemoryMmap> {
         match self {
-            Self::Activated { mem } => mem.clone(),
-            Self::Inactive => panic!("device not activated"),
+            Self::Activated { mem } => Some(mem.clone()),
+            Self::Inactive => None,
         }
     }
 }
@@ -397,14 +396,16 @@ impl Blk {
     }
 
     pub fn process_queue(&mut self) -> io::Result<()> {
-        let mem = self.state.unwrap();
+        let mem = self
+            .state
+            .activated_mem()
+            .expect("process_queue called before device activation");
         let mut try_notify = false;
 
         loop {
             let desc = match self.queues[0].pop(&mem) {
                 Ok(Some(desc)) => desc,
-                Ok(None) => break,
-                Err(_) => break,
+                Ok(None) | Err(_) => break,
             };
 
             let desc_index = desc.index;
@@ -425,10 +426,8 @@ impl Blk {
             }
         }
 
-        let should_notify = {
-            let queue = &mut self.queues[0];
-            try_notify && queue.prepare_notify(&mem)
-        };
+        let queue = &mut self.queues[0];
+        let should_notify = try_notify && queue.prepare_notify(&mem);
         if should_notify {
             self.irq_trigger.trigger(IrqType::Vring)?;
         }
