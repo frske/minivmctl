@@ -1,7 +1,7 @@
 use std::{
     fs::File,
     io,
-    mem::{transmute, zeroed},
+    mem::transmute,
     ops::Deref,
     os::fd::{AsRawFd, FromRawFd},
     sync::{
@@ -23,6 +23,9 @@ const TUN_F_TSO_ECN: libc::c_uint = 0x08;
 const TUN_F_UFO: libc::c_uint = 0x10;
 const TUN_F_USO4: libc::c_uint = 0x20;
 const TUN_F_USO6: libc::c_uint = 0x40;
+
+const IRQ_BIT_VRING: u32 = 0x1;
+const IRQ_BIT_CONFIG: u32 = 0x2;
 
 const NET_NUM_QUEUES: usize = 2;
 const RX_INDEX: usize = 0;
@@ -76,8 +79,8 @@ impl IrqTrigger {
 
     fn trigger(&self, irq_type: IrqType) -> io::Result<()> {
         let bit = match irq_type {
-            IrqType::Config => 0x2,
-            IrqType::Vring => 0x1,
+            IrqType::Config => IRQ_BIT_CONFIG,
+            IrqType::Vring => IRQ_BIT_VRING,
         };
         self.irq_status.fetch_or(bit, Ordering::SeqCst);
         self.irq_evt.write(1)
@@ -180,7 +183,7 @@ impl Tap {
 
         let mut ifr = ifreq {
             ifr_name: unsafe { transmute::<[u8; IFNAMSIZ], [libc::c_char; IFNAMSIZ]>(cname) },
-            ifr_ifru: unsafe { zeroed() },
+            ifr_ifru: unsafe { std::mem::zeroed() },
         };
 
         ifr.ifr_ifru.ifru_flags = FLAGS;
@@ -354,7 +357,6 @@ where
         if let Some(config_space_bytes) = self.config_space.as_slice().get(offset as usize..) {
             let len = config_space_bytes.len().min(data.len());
             data[..len].copy_from_slice(&config_space_bytes[..len]);
-            println!("read config space {len}");
         }
     }
 
@@ -369,7 +371,6 @@ where
 
         self.activate_event.write(1)?;
         self.state = DeviceState::Activated { mem };
-        println!("activate done");
         Ok(())
     }
 
@@ -419,25 +420,16 @@ where
         loop {
             let desc = match queue.pop(&mem) {
                 Ok(Some(x)) => x,
-                Ok(None) => break,
-                Err(e) => {
-                    println!("queue pop failed in process_tx: {:?}", e);
-                    continue;
-                }
+                Ok(None) | Err(_) => break,
             };
 
             let desc_index = desc.index;
-            match self.tap.writev(desc) {
-                Ok(_n) => {
-                    queue.push(&mem, desc_index, 0);
-                    try_notify = true;
-                }
-                Err(_e) => {
-                    queue.push(&mem, desc_index, 0);
-                    println!("tap writev failed");
-                    try_notify = true;
-                }
-            };
+            let write_succeeded = self.tap.writev(desc).is_ok();
+            queue.push(&mem, desc_index, 0);
+            if !write_succeeded {
+                // Tap write errors are non-fatal; we still complete the descriptor.
+            }
+            try_notify = true;
         }
 
         if try_notify && queue.prepare_notify(&mem) {
@@ -458,19 +450,13 @@ where
             let desc = match queue.pop(&mem) {
                 Ok(Some(x)) => x,
                 Ok(None) => break,
-                Err(e) => {
-                    println!("queue pop failed in process_rx: {:?}", e);
-                    continue;
-                }
+                Err(_) => continue,
             };
             let desc_index = desc.index;
+
             match self.tap.readv(desc.clone()) {
                 Ok(n) => {
-                    if let Err(_e) =
-                        desc.write_at(VNET_HDR_NUM_BUFFERS_OFFSET, &u16::to_le_bytes(1))
-                    {
-                        println!("failed to write vnet header num buffers");
-                    }
+                    write_vnet_num_buffers(&desc);
                     queue.push(&mem, desc_index, n as u32);
                     try_notify = true;
                 }
@@ -478,12 +464,11 @@ where
                     queue.undo_pop();
                     break;
                 }
-                Err(e) => {
-                    println!("tap readv failed: {:?}", e);
+                Err(_) => {
                     queue.push(&mem, desc_index, 0);
                     try_notify = true;
                 }
-            };
+            }
         }
 
         if try_notify && queue.prepare_notify(&mem) {
@@ -492,6 +477,14 @@ where
 
         Ok(())
     }
+}
+
+fn write_vnet_num_buffers<M>(desc: &DescriptorChain<M>)
+where
+    M: Deref + Clone,
+    M::Target: GuestMemoryBackend,
+{
+    let _ = desc.clone().write_at(VNET_HDR_NUM_BUFFERS_OFFSET, &u16::to_le_bytes(1));
 }
 
 impl Net<Tap> {
