@@ -3,6 +3,7 @@ const SSH_KEY_STORAGE_KEY = "scratch.vm.sshPublicKey";
 
 const form = document.querySelector("#create-form");
 const nameInput = document.querySelector("#name");
+const memoryInput = document.querySelector("#memory-mib");
 const sshKeyInput = document.querySelector("#ssh-key");
 const message = document.querySelector("#message");
 const refreshButton = document.querySelector("#refresh");
@@ -47,7 +48,7 @@ function setMessage(text, kind = "") {
 
 function renderVms(vms) {
   if (vms.length === 0) {
-    vmList.innerHTML = '<tr><td colspan="5" class="empty">No VMs running</td></tr>';
+    vmList.innerHTML = '<tr><td colspan="6" class="empty">No VMs running</td></tr>';
     return;
   }
 
@@ -66,6 +67,7 @@ function renderVms(vms) {
             </svg>
           </button>
         </td>
+        <td><span class="mono">${vm.memory_mib} MiB</span></td>
         <td><span class="status">${escapeHtml(vm.status)}</span></td>
         <td><button class="danger" type="button" data-id="${vm.id}">Delete</button></td>
       `;
@@ -104,6 +106,7 @@ form.addEventListener("submit", async (event) => {
       body: JSON.stringify({
         name: nameInput.value.trim(),
         ssh_key: sshKey,
+        memory_mib: Number(memoryInput.value),
       }),
     });
     nameInput.value = "";

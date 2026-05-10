@@ -27,6 +27,18 @@
           </label>
 
           <label>
+            RAM MiB
+            <select id="memory-mib" name="memory_mib" required>
+              <option value="128">128 MiB</option>
+              <option value="256">256 MiB</option>
+              <option value="512" selected>512 MiB</option>
+              <option value="1024">1 GiB</option>
+              <option value="2048">2 GiB</option>
+              <option value="3072">3 GiB</option>
+            </select>
+          </label>
+
+          <label>
             SSH public key
             <textarea id="ssh-key" name="ssh_key" rows="3" required></textarea>
           </label>
@@ -46,13 +58,14 @@
                 <th>ID</th>
                 <th>Name</th>
                 <th>IP Address</th>
+                <th>RAM</th>
                 <th>Status</th>
                 <th></th>
               </tr>
             </thead>
             <tbody id="vm-list">
               <tr>
-                <td colspan="5" class="empty">No data loaded</td>
+                <td colspan="6" class="empty">No data loaded</td>
               </tr>
             </tbody>
           </table>
