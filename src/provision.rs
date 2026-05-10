@@ -256,7 +256,7 @@ fn create_net_config(id: u8) -> Ini {
         .set("Gateway", gateway)
         .set("DNS", "8.8.8.8");
 
-    return conf;
+    conf
 }
 
 fn provision_guest_net_config(id: u8, conf: Ini, mount_path: &Path) -> ProvisionResult<()> {
@@ -276,11 +276,15 @@ fn provision_guest_net_config(id: u8, conf: Ini, mount_path: &Path) -> Provision
 fn mount_rootfs(block_device_path: &Path, mount_path: &Path) -> ProvisionResult<()> {
     println!("Mounting block device");
 
+    let device_str = block_device_path
+        .to_str()
+        .ok_or_else(|| format!("invalid device path: {:?}", block_device_path))?;
+    let mount_str = mount_path
+        .to_str()
+        .ok_or_else(|| format!("invalid mount path: {:?}", mount_path))?;
+
     Command::new("mount")
-        .args([
-            block_device_path.to_str().unwrap(),
-            mount_path.to_str().unwrap(),
-        ])
+        .args([device_str, mount_str])
         .status()?;
 
     Ok(())
