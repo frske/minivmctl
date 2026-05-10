@@ -45,14 +45,15 @@ where
 {
     pub fn new(mem: M, desc_table: GuestAddress, queue_size: u16, index: u16) -> Result<Self, ()> {
         if index >= queue_size {
-            eprintln!("invalid index {index}, queue size: {queue_size}");
+            tracing::warn!(index, queue_size, "invalid descriptor index");
             return Err(());
         }
         Ok(Self::new_unchecked(mem, desc_table, queue_size, index))
     }
 
     pub fn new_unchecked(mem: M, desc_table: GuestAddress, queue_size: u16, index: u16) -> Self {
-        let addr = desc_table.unchecked_add(u64::from(index) * std::mem::size_of::<Descriptor>() as u64);
+        let addr =
+            desc_table.unchecked_add(u64::from(index) * std::mem::size_of::<Descriptor>() as u64);
         let desc = mem.read_obj::<Descriptor>(addr).unwrap();
 
         Self {
@@ -72,7 +73,13 @@ where
         M: Clone,
     {
         if self.has_next() {
-            Self::new(self.mem.clone(), self.desc_table, self.queue_size, self.next).ok()
+            Self::new(
+                self.mem.clone(),
+                self.desc_table,
+                self.queue_size,
+                self.next,
+            )
+            .ok()
         } else {
             None
         }
@@ -175,8 +182,12 @@ impl Queue {
     }
 
     fn write_avail_event<M: Deref<Target = impl GuestMemoryBackend>>(&self, mem: &M) {
-        let avail_event_addr = self.used_ring.unchecked_add((u64::from(self.size) << 3) + 4);
-        mem.deref().write_obj(self.next_avail.0, avail_event_addr).unwrap();
+        let avail_event_addr = self
+            .used_ring
+            .unchecked_add((u64::from(self.size) << 3) + 4);
+        mem.deref()
+            .write_obj(self.next_avail.0, avail_event_addr)
+            .unwrap();
     }
 
     pub fn push<M: GuestMemoryBackend>(&mut self, mem: &M, desc_index: u16, len: u32) {
@@ -203,8 +214,7 @@ impl Queue {
         self.next_used += 1;
         fence(Ordering::Release);
         let used_idx_addr = self.used_ring.unchecked_add(2);
-        mem.write_obj(self.next_used.0, used_idx_addr)
-            .unwrap();
+        mem.write_obj(self.next_used.0, used_idx_addr).unwrap();
     }
 
     pub fn undo_pop(&mut self) {
@@ -216,7 +226,9 @@ impl Queue {
             return mem.read_obj::<u16>(self.avail_ring).unwrap() == 0;
         }
         fence(Ordering::AcqRel);
-        let used_event_addr = self.avail_ring.unchecked_add((u64::from(self.size) << 1) + 4);
+        let used_event_addr = self
+            .avail_ring
+            .unchecked_add((u64::from(self.size) << 1) + 4);
         let used_event = Wrapping(mem.read_obj::<u16>(used_event_addr).unwrap());
         let num_added = self.num_added;
         self.num_added = Wrapping(0);
@@ -237,7 +249,12 @@ impl Queue {
             && self.region_accessible(mem, self.used_ring, self.size as usize * 8 + 6)
     }
 
-    fn region_accessible<M: GuestMemoryBackend>(&self, mem: &M, addr: GuestAddress, len: usize) -> bool {
+    fn region_accessible<M: GuestMemoryBackend>(
+        &self,
+        mem: &M,
+        addr: GuestAddress,
+        len: usize,
+    ) -> bool {
         mem.get_slice(addr, len).is_ok()
     }
 
@@ -259,7 +276,8 @@ impl Queue {
 
     fn avail_idx<M: GuestMemoryBackend>(&self, mem: &M) -> Wrapping<u16> {
         Wrapping(
-            mem.read_obj::<u16>(self.avail_ring.unchecked_add(2)).unwrap(),
+            mem.read_obj::<u16>(self.avail_ring.unchecked_add(2))
+                .unwrap(),
         )
     }
 

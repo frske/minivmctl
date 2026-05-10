@@ -484,7 +484,9 @@ where
     M: Deref + Clone,
     M::Target: GuestMemoryBackend,
 {
-    let _ = desc.clone().write_at(VNET_HDR_NUM_BUFFERS_OFFSET, &u16::to_le_bytes(1));
+    let _ = desc
+        .clone()
+        .write_at(VNET_HDR_NUM_BUFFERS_OFFSET, &u16::to_le_bytes(1));
 }
 
 impl Net<Tap> {

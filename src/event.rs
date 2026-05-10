@@ -72,8 +72,11 @@ impl<T> EventLoop<T> {
         event: EventSet,
         user_data: usize,
     ) -> io::Result<()> {
-        self.epoll
-            .ctl(ControlOperation::Add, fd, EpollEvent::new(event, user_data as u64))
+        self.epoll.ctl(
+            ControlOperation::Add,
+            fd,
+            EpollEvent::new(event, user_data as u64),
+        )
     }
 }
 

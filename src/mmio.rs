@@ -13,6 +13,7 @@ use std::{
 };
 
 use crate::virtio::{Queue, VirtioDevice};
+use tracing::{debug, warn};
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemoryMmap;
 
@@ -142,19 +143,25 @@ impl MMIOTransport {
         }
         let all_queues_valid = device.queues().iter().all(|q| q.is_valid(&self.mem));
         if !all_queues_valid {
+            warn!("device activation requested before all queues are valid");
             return;
         }
-        if device.activate(self.mem.clone()).is_err() {
+        if let Err(err) = device.activate(self.mem.clone()) {
             self.device_status |= device_status::DEVICE_NEEDS_RESET;
             let _ = device.interrupt_trigger().trigger(); //there was a trigger type here IrqType::Config
             //no clue what is supposed ot happen here, probably just trigger() with no type+
+            warn!(error = %err, "device activation failed");
+            return;
         }
+
+        debug!("device activated");
     }
 
     fn reset_or_fail(&mut self) {
         let mut device = self.device.lock().unwrap();
         if device.is_activated() && device.reset().is_none() {
             self.device_status |= device_status::FAILED;
+            warn!("device reset failed");
         }
         if self.device_status & device_status::FAILED == 0 {
             self.features_select = 0;
