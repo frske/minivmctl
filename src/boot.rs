@@ -51,7 +51,7 @@ pub struct BootArtifacts {
     pub guest_mem: GuestMemoryMmap<()>,
 }
 
-pub fn setup(kernel_path: &str) -> BootArtifacts {
+pub fn setup(kernel_path: &str, memory_size: usize) -> BootArtifacts {
     let kvm = Kvm::new().expect("Open kvm device failed");
     let vm = kvm.create_vm().expect("create vm failed");
 
@@ -61,11 +61,11 @@ pub fn setup(kernel_path: &str) -> BootArtifacts {
     let boot_pde_addr = GuestAddress(0xc000);
 
     let guest_addr = GuestAddress(0x0);
-    let guest_mem = GuestMemoryMmap::<()>::from_ranges(&[(guest_addr, MEMORY_SIZE)]).unwrap();
+    let guest_mem = GuestMemoryMmap::<()>::from_ranges(&[(guest_addr, memory_size)]).unwrap();
 
     let kernel_entry = load_kernel(&guest_mem, kernel_path);
 
-    register_guest_memory(&vm, &guest_mem);
+    register_guest_memory(&vm, &guest_mem, memory_size);
     write_page_tables(
         &guest_mem,
         boot_pdpte_addr,
@@ -95,12 +95,12 @@ pub fn setup(kernel_path: &str) -> BootArtifacts {
     }
 }
 
-pub fn register_guest_memory(vm: &VmFd, guest_mem: &GuestMemoryMmap<()>) {
+pub fn register_guest_memory(vm: &VmFd, guest_mem: &GuestMemoryMmap<()>, memory_size: usize) {
     let host_addr = guest_mem.get_host_address(GuestAddress(0)).unwrap();
     let mem_region = kvm_userspace_memory_region {
         slot: 0,
         guest_phys_addr: 0,
-        memory_size: MEMORY_SIZE as u64,
+        memory_size: memory_size as u64,
         userspace_addr: host_addr as u64,
         flags: KVM_MEM_LOG_DIRTY_PAGES,
     };
