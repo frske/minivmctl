@@ -1211,6 +1211,8 @@ dependencies = [
  "serde_json",
  "slab",
  "tiny_http",
+ "tracing",
+ "tracing-subscriber",
  "vm-memory",
  "vm-superio",
  "vmm-sys-util",
