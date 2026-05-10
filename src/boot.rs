@@ -295,10 +295,8 @@ pub const fn to_gdt_entry(seg: &kvm_segment) -> u64 {
     let limit = seg.limit as u64;
 
     let limit_high = (limit >> 16) & 0xf;
-    let flag_bits = ((seg.g as u64) << 3)
-        | ((seg.db as u64) << 2)
-        | ((seg.l as u64) << 1)
-        | (seg.avl as u64);
+    let flag_bits =
+        ((seg.g as u64) << 3) | ((seg.db as u64) << 2) | ((seg.l as u64) << 1) | (seg.avl as u64);
     let upper_byte = (limit_high << 8) | flag_bits;
 
     let access_byte = ((seg.present as u64) << 7)

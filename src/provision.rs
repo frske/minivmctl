@@ -5,6 +5,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tracing::{debug, info};
 
 const ROOTFS_PATH: &str = "/home/frsk/prj/kernel_images/rootfs.ext4";
 // const ROOTFS_PATH: &str = "/home/frsk/prj/kernel_images/rootfs.ext4";
@@ -27,6 +28,7 @@ pub fn provision_shared_host() -> ProvisionResult<()> {
 
     let host_interface = default_interface_name()?;
 
+    debug!(interface = %host_interface, "provisioning shared host networking");
     ensure_bridge_exists()?;
     configure_iptables(&host_interface)?;
 
@@ -38,6 +40,7 @@ pub fn provision_vm_host(id: u8) -> ProvisionResult<()> {
         return Err("provision_vm_host requires root".into());
     }
 
+    debug!(id, "provisioning vm host networking");
     configure_tap_interface(id)
 }
 
@@ -46,6 +49,7 @@ pub fn provision_guest(id: u8, public_ssh_key: &str) -> ProvisionResult<()> {
         return Err("provision_guest requires root".into());
     }
 
+    debug!(id, "provisioning guest rootfs");
     let block_device = create_rootfs(id)?;
 
     let mount_path = vm_rootfs_dir(id).join("mnt");
@@ -65,6 +69,7 @@ pub fn provision_guest(id: u8, public_ssh_key: &str) -> ProvisionResult<()> {
 
 pub fn deprovision_guest(id: u8) -> ProvisionResult<()> {
     let rootfs_dir = vm_rootfs_dir(id);
+    debug!(id, rootfs_dir = %rootfs_dir.display(), "deprovisioning guest rootfs");
     fs::remove_dir_all(&rootfs_dir)?;
     Ok(())
 }
@@ -75,6 +80,7 @@ pub fn deprovision_vm_host(id: u8) -> ProvisionResult<()> {
     }
 
     let tap_name = format!("tap{}", id);
+    debug!(id, tap = %tap_name, "deprovisioning vm host networking");
 
     let status = Command::new("ip")
         .args(["tuntap", "del", "dev", &tap_name, "mode", "tap"])
@@ -94,6 +100,7 @@ pub fn deprovision_shared_host() -> ProvisionResult<()> {
 
     let host_interface = default_interface_name()?;
 
+    debug!(interface = %host_interface, "deprovisioning shared host networking");
     deconfigure_iptables(&host_interface)?;
     remove_bridge()?;
 
@@ -126,7 +133,7 @@ fn ensure_bridge_exists() -> ProvisionResult<()> {
         _ => {}
     }
 
-    println!("Creating bridge br0");
+    info!("creating bridge br0");
 
     Command::new("ip")
         .args(["link", "add", "br0", "type", "bridge"])
@@ -150,6 +157,7 @@ fn ensure_bridge_exists() -> ProvisionResult<()> {
 
 fn configure_tap_interface(id: u8) -> ProvisionResult<()> {
     let tap_name = format!("tap{}", id);
+    debug!(id, tap = %tap_name, "configuring tap interface");
 
     let exists = Command::new("ip")
         .args(["link", "show", &tap_name])
@@ -178,6 +186,7 @@ fn configure_tap_interface(id: u8) -> ProvisionResult<()> {
 
 fn configure_iptables(interface_name: &str) -> ProvisionResult<()> {
     let ipt = iptables::new(false).map_err(|e| e.to_string())?;
+    debug!(interface = %interface_name, "configuring iptables");
 
     for (table, chain, rule) in iptables_rules(interface_name) {
         if !ipt.exists(table, chain, &rule).map_err(|e| e.to_string())? {
@@ -190,6 +199,7 @@ fn configure_iptables(interface_name: &str) -> ProvisionResult<()> {
 
 fn deconfigure_iptables(interface_name: &str) -> ProvisionResult<()> {
     let ipt = iptables::new(false).map_err(|e| e.to_string())?;
+    debug!(interface = %interface_name, "deconfiguring iptables");
 
     for (table, chain, rule) in iptables_rules(interface_name) {
         if ipt.exists(table, chain, &rule).map_err(|e| e.to_string())? {
@@ -244,7 +254,7 @@ fn remove_bridge() -> ProvisionResult<()> {
 }
 
 fn create_net_config(id: u8) -> Ini {
-    println!("Creating network config file");
+    debug!(id, "creating network config file");
     let ip_address = format!("10.10.0.{}/24", id + 2);
     let gateway = "10.10.0.1";
     let mut conf = Ini::new();
@@ -266,7 +276,7 @@ fn provision_guest_net_config(id: u8, conf: Ini, mount_path: &Path) -> Provision
         .join("network")
         .join(format!("{}-eth.network", id));
 
-    println!("Writing network config file");
+    debug!(path = %conf_path.display(), "writing network config file");
 
     conf.write_to_file(&conf_path)?;
 
@@ -274,14 +284,14 @@ fn provision_guest_net_config(id: u8, conf: Ini, mount_path: &Path) -> Provision
 }
 
 fn mount_rootfs(block_device_path: &Path, mount_path: &Path) -> ProvisionResult<()> {
-    println!("Mounting block device");
-
     let device_str = block_device_path
         .to_str()
         .ok_or_else(|| format!("invalid device path: {:?}", block_device_path))?;
     let mount_str = mount_path
         .to_str()
         .ok_or_else(|| format!("invalid mount path: {:?}", mount_path))?;
+
+    debug!(device = %device_str, mount = %mount_str, "mounting block device");
 
     Command::new("mount")
         .args([device_str, mount_str])
@@ -291,7 +301,7 @@ fn mount_rootfs(block_device_path: &Path, mount_path: &Path) -> ProvisionResult<
 }
 
 fn unmount_rootfs(mount_path: &Path) -> ProvisionResult<()> {
-    println!("Unmounting block device");
+    debug!(mount = %mount_path.display(), "unmounting block device");
 
     umount(mount_path)?;
     let _ = fs::remove_dir_all(mount_path);
