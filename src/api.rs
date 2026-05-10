@@ -13,6 +13,9 @@ use rocket::{
 
 use crate::vm_manager::{VmInfo, VmManagerHandle};
 
+const ALLOWED_ORIGINS: &[&str] =
+    &["http://127.0.0.1:5173", "http://localhost:5173", "http://0.0.0.0:5173"];
+
 #[derive(Debug, Serialize)]
 #[serde(crate = "rocket::serde")]
 struct VmResponse {
@@ -52,10 +55,9 @@ pub fn rocket(handle: VmManagerHandle) -> Rocket<Build> {
 
 #[get("/vms")]
 fn list_vms(handle: &State<VmManagerHandle>) -> ApiResult<Vec<VmResponse>> {
-    handle
-        .list_vms()
-        .map(|vms| Json(vms.into_iter().map(VmResponse::from).collect()))
-        .map_err(api_error)
+    let vms = handle.list_vms().map_err(api_error)?;
+    let responses: Vec<VmResponse> = vms.into_iter().map(VmResponse::from).collect();
+    Ok(Json(responses))
 }
 
 #[post("/vms", data = "<request>")]
@@ -96,25 +98,32 @@ impl Fairing for Cors {
     }
 
     async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Response<'r>) {
-        let origin = request.headers().get_one("Origin");
-        if let Some(origin) = origin.filter(|origin| is_allowed_origin(origin)) {
-            response.set_header(Header::new("Access-Control-Allow-Origin", origin));
-        }
+        let origin = match request.headers().get_one("Origin") {
+            Some(origin) if is_allowed_origin(origin) => origin,
+            _ => {
+                set_cors_headers(response, None);
+                return;
+            }
+        };
 
-        response.set_header(Header::new(
-            "Access-Control-Allow-Methods",
-            "GET, POST, DELETE, OPTIONS",
-        ));
-        response.set_header(Header::new("Access-Control-Allow-Headers", "Content-Type"));
-        response.set_header(Header::new("Vary", "Origin"));
+        set_cors_headers(response, Some(origin));
     }
 }
 
+fn set_cors_headers<'a>(response: &mut Response<'a>, origin: Option<&'a str>) {
+    if let Some(origin) = origin {
+        response.set_header(Header::new("Access-Control-Allow-Origin", origin));
+    }
+    response.set_header(Header::new(
+        "Access-Control-Allow-Methods",
+        "GET, POST, DELETE, OPTIONS",
+    ));
+    response.set_header(Header::new("Access-Control-Allow-Headers", "Content-Type"));
+    response.set_header(Header::new("Vary", "Origin"));
+}
+
 fn is_allowed_origin(origin: &str) -> bool {
-    matches!(
-        origin,
-        "http://127.0.0.1:5173" | "http://localhost:5173" | "http://0.0.0.0:5173"
-    )
+    ALLOWED_ORIGINS.contains(&origin)
 }
 
 impl From<VmInfo> for VmResponse {
