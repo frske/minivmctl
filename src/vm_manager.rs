@@ -48,6 +48,7 @@ enum VmCommand {
     Start {
         name: String,
         ssh_key: String,
+        memory_mib: u32,
         response: mpsc::Sender<VmManagerResult<VmInfo>>,
     },
     List {
@@ -76,13 +77,19 @@ impl Clone for VmManagerHandle {
 }
 
 impl VmManagerHandle {
-    pub fn start_vm(&self, name: String, ssh_key: String) -> VmManagerResult<VmInfo> {
+    pub fn start_vm(
+        &self,
+        name: String,
+        ssh_key: String,
+        memory_mib: u32,
+    ) -> VmManagerResult<VmInfo> {
         self.send_command(
             "vm manager is not running",
             Duration::from_secs(120),
             |response| VmCommand::Start {
                 name,
                 ssh_key,
+                memory_mib,
                 response,
             },
         )
@@ -136,6 +143,7 @@ pub struct VmInfo {
     pub id: u8,
     pub name: String,
     pub ip_address: String,
+    pub memory_mib: u32,
     pub status: &'static str,
 }
 
@@ -159,6 +167,7 @@ pub struct VmConfig {
     id: u8,
     name: String,
     ssh_key: String,
+    memory_mib: u32,
 }
 
 impl VmConfig {
@@ -172,6 +181,14 @@ impl VmConfig {
 
     pub fn ssh_key(&self) -> &str {
         &self.ssh_key
+    }
+
+    pub fn memory_mib(&self) -> u32 {
+        self.memory_mib
+    }
+
+    pub fn memory_size(&self) -> usize {
+        self.memory_mib as usize * 1024 * 1024
     }
 
     pub fn tap_name(&self) -> String {
@@ -308,10 +325,11 @@ impl VmManager {
                 VmCommand::Start {
                     name,
                     ssh_key,
+                    memory_mib,
                     response,
                 } => {
-                    info!(name = %name, "start vm command received");
-                    let config = self.vm_config(name, ssh_key);
+                    info!(name = %name, memory_mib, "start vm command received");
+                    let config = self.vm_config(name, ssh_key, memory_mib);
                     let _ = response.send(self.start_vm(config, poll, routes, next_token_count));
                 }
                 VmCommand::List { response } => {
@@ -358,11 +376,12 @@ impl VmManager {
         id
     }
 
-    fn vm_config(&mut self, name: String, ssh_key: String) -> VmConfig {
+    fn vm_config(&mut self, name: String, ssh_key: String, memory_mib: u32) -> VmConfig {
         VmConfig {
             id: self.next_avail_id(),
             name,
             ssh_key,
+            memory_mib,
         }
     }
 
@@ -373,7 +392,12 @@ impl VmManager {
         routes: &mut HashMap<u8, EventRoute>,
         next_token_count: &mut usize,
     ) -> VmManagerResult<VmInfo> {
-        info!(vm_id = config.id(), name = %config.name(), "starting vm");
+        info!(
+            vm_id = config.id(),
+            name = %config.name(),
+            memory_mib = config.memory_mib(),
+            "starting vm"
+        );
         if self.configs.contains_key(&config.id()) || self.instances.contains_key(&config.id()) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -467,6 +491,7 @@ struct VmInstance {
     id: u8,
     name: String,
     ip_address: String,
+    memory_mib: u32,
     _vm: VmFd,
     vcpu_stopper: VcpuStopper,
     net: NetDeviceRuntime,
@@ -492,6 +517,7 @@ impl VmInstance {
             "vm",
             vm_id = config.id(),
             name = %config.name(),
+            memory_mib = config.memory_mib(),
             guest_ip = %config.guest_ip()
         );
         let _entered = span.enter();
@@ -521,6 +547,7 @@ impl VmInstance {
             id: config.id(),
             name: config.name().to_string(),
             ip_address: config.guest_ip(),
+            memory_mib: config.memory_mib(),
             _vm: vm,
             vcpu_stopper,
             net,
@@ -547,8 +574,8 @@ impl VmInstance {
         Ok(())
     }
 
-    fn boot_vm(_config: &VmConfig) -> VmManagerResult<BootArtifacts> {
-        Ok(boot::setup(KERNEL_PATH))
+    fn boot_vm(config: &VmConfig) -> VmManagerResult<BootArtifacts> {
+        Ok(boot::setup(KERNEL_PATH, config.memory_size()))
     }
 
     fn create_net_device(
@@ -660,6 +687,7 @@ impl VmInstance {
             id: self.id,
             name: self.name.clone(),
             ip_address: self.ip_address.clone(),
+            memory_mib: self.memory_mib,
             status: "running",
         }
     }
@@ -1021,6 +1049,7 @@ mod tests {
             id,
             name: format!("vm-{id}"),
             ssh_key: "ssh-ed25519 test".to_string(),
+            memory_mib: 512,
         }
     }
 
@@ -1032,6 +1061,8 @@ mod tests {
         assert_eq!(config.guest_ip(), "10.10.0.9");
         assert_eq!(config.guest_mac(), [0x02, 0x12, 0x34, 0x56, 0x78, 7]);
         assert_eq!(config.rootfs_path(), PathBuf::from("/tmp/vm-7/rootfs.ext4"));
+        assert_eq!(config.memory_mib(), 512);
+        assert_eq!(config.memory_size(), 512 << 20);
     }
 
     #[test]
@@ -1128,7 +1159,7 @@ mod tests {
         let handle = manager.handle().unwrap();
 
         let err = handle
-            .start_vm("test-vm".to_string(), "ssh-ed25519 test".to_string())
+            .start_vm("test-vm".to_string(), "ssh-ed25519 test".to_string(), 512)
             .unwrap_err();
 
         assert_eq!(
