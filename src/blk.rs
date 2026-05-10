@@ -39,6 +39,10 @@ enum RequestType {
     Unsupported(u32),
 }
 
+fn test(  ) {
+    println!("jsjdjsj");
+}
+
 impl From<u32> for RequestType {
     fn from(value: u32) -> Self {
         match value {
