@@ -13,6 +13,7 @@ const vmList = document.querySelector("#vm-list");
 sshKeyInput.value = localStorage.getItem(SSH_KEY_STORAGE_KEY) ?? "";
 
 async function api(path, options = {}) {
+  const method = options.method ?? "GET";
   let response;
   try {
     response = await fetch(`${API_BASE}${path}`, {
@@ -20,7 +21,10 @@ async function api(path, options = {}) {
       ...options,
     });
   } catch (error) {
-    throw new Error(`Cannot reach API at ${API_BASE}. Check backend is running and CORS is allowed.`);
+    console.error(error);
+    throw new Error(
+      `Cannot reach API for ${method} ${path} at ${API_BASE}. Check backend is running and CORS is allowed.`,
+    );
   }
 
   const body = await readJson(response);
@@ -44,6 +48,10 @@ function setBusy(isBusy) {
 function setMessage(text, kind = "") {
   message.textContent = text;
   message.className = `message ${kind}`.trim();
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function renderVms(vms) {
@@ -97,6 +105,8 @@ async function loadVms() {
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   setBusy(true);
+  const name = nameInput.value.trim();
+  const memoryMib = Number(memoryInput.value);
   const sshKey = sshKeyInput.value.trim();
 
   try {
@@ -104,17 +114,35 @@ form.addEventListener("submit", async (event) => {
     const vm = await api("/vms", {
       method: "POST",
       body: JSON.stringify({
-        name: nameInput.value.trim(),
+        name,
         ssh_key: sshKey,
-        memory_mib: Number(memoryInput.value),
+        memory_mib: memoryMib,
       }),
     });
     nameInput.value = "";
     sshKeyInput.value = sshKey;
     setMessage(`VM ${vm.id} created.`, "ok");
-    await loadVms();
+    try {
+      renderVms(await api("/vms"));
+    } catch (error) {
+      setMessage(`VM ${vm.id} created, but refresh failed: ${error.message}`, "error");
+    }
   } catch (error) {
-    setMessage(error.message, "error");
+    try {
+      await sleep(500);
+      const vms = await api("/vms");
+      renderVms(vms);
+      const vm = vms.find((vm) => vm.name === name && vm.memory_mib === memoryMib);
+      if (vm) {
+        nameInput.value = "";
+        sshKeyInput.value = sshKey;
+        setMessage(`VM ${vm.id} created.`, "ok");
+      } else {
+        setMessage(`Create request could not be confirmed: ${error.message}`, "error");
+      }
+    } catch (refreshError) {
+      setMessage(`Create request sent, but confirmation failed: ${refreshError.message}`, "error");
+    }
   } finally {
     setBusy(false);
   }
@@ -145,8 +173,11 @@ vmList.addEventListener("click", async (event) => {
   setBusy(true);
   try {
     await api(`/vms/${button.dataset.id}`, { method: "DELETE" });
+    button.closest("tr")?.remove();
+    if (vmList.children.length === 0) {
+      vmList.innerHTML = '<tr><td colspan="6" class="empty">No VMs running</td></tr>';
+    }
     setMessage(`VM ${button.dataset.id} stop requested.`, "ok");
-    await loadVms();
   } catch (error) {
     setMessage(error.message, "error");
   } finally {
