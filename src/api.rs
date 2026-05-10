@@ -10,11 +10,15 @@ use rocket::{
     routes,
     serde::{Deserialize, Serialize, json::Json},
 };
+use tracing::{debug, info, warn};
 
 use crate::vm_manager::{VmInfo, VmManagerHandle};
 
-const ALLOWED_ORIGINS: &[&str] =
-    &["http://127.0.0.1:5173", "http://localhost:5173", "http://0.0.0.0:5173"];
+const ALLOWED_ORIGINS: &[&str] = &[
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+    "http://0.0.0.0:5173",
+];
 
 #[derive(Debug, Serialize)]
 #[serde(crate = "rocket::serde")]
@@ -55,6 +59,7 @@ pub fn rocket(handle: VmManagerHandle) -> Rocket<Build> {
 
 #[get("/vms")]
 fn list_vms(handle: &State<VmManagerHandle>) -> ApiResult<Vec<VmResponse>> {
+    debug!("list vms requested");
     let vms = handle.list_vms().map_err(api_error)?;
     let responses: Vec<VmResponse> = vms.into_iter().map(VmResponse::from).collect();
     Ok(Json(responses))
@@ -65,6 +70,7 @@ fn create_vm(
     handle: &State<VmManagerHandle>,
     request: Json<CreateVmRequest>,
 ) -> ApiResult<VmResponse> {
+    info!(name = %request.name, "create vm requested");
     let vm = handle
         .start_vm(request.name.clone(), request.ssh_key.clone())
         .map_err(api_error)?;
@@ -74,6 +80,7 @@ fn create_vm(
 
 #[delete("/vms/<id>")]
 fn delete_vm(handle: &State<VmManagerHandle>, id: u8) -> ApiResult<ApiMessage> {
+    info!(id, "delete vm requested");
     handle.request_stop_vm(id).map_err(api_error)?;
 
     Ok(Json(ApiMessage {
@@ -142,6 +149,12 @@ fn api_error(err: Box<dyn std::error::Error + Send + Sync>) -> status::Custom<Js
         .downcast_ref::<io::Error>()
         .map(io_status)
         .unwrap_or(Status::InternalServerError);
+
+    if status.code >= 500 {
+        warn!(status = %status, error = %err, "api request failed");
+    } else {
+        debug!(status = %status, error = %err, "api request failed");
+    }
 
     status::Custom(
         status,
