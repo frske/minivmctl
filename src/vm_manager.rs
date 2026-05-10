@@ -34,12 +34,12 @@ use crate::{
 type HostSerial = Serial<EventWrapper, DummySerialEvent, std::io::Sink>;
 pub type VmManagerResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+const MMIO_MEM_START: u64 = 0xd0000000;
 const BLK_MMIO_MEM_START: u64 = MMIO_MEM_START + 0x1000;
+const QUEUE_NOTIFY_OFFSET: u64 = 0x50;
 const COM1: u16 = 0x3f8;
 const COMMAND_TOKEN: u8 = 0;
 const KERNEL_PATH: &str = "/home/frsk/prj/kernel_images/linux-6.6.99/vmlinux";
-const MMIO_MEM_START: u64 = 0xd0000000;
-const QUEUE_NOTIFY_OFFSET: u64 = 0x50;
 const VM_STOP_SIGNAL: libc::c_int = libc::SIGUSR1;
 static STOP_SIGNAL_HANDLER_RESULT: OnceLock<Result<(), i32>> = OnceLock::new();
 
@@ -390,7 +390,8 @@ impl VmManager {
         };
         self.instances.insert(vm_id, instance);
 
-        if let Err(err) = self.instances.get(&vm_id).unwrap().register_events(
+        let instance = self.instances.get(&vm_id).unwrap();
+        if let Err(err) = instance.register_events(
             vm_id,
             poll,
             routes,
@@ -403,7 +404,7 @@ impl VmManager {
             return Err(err);
         }
 
-        Ok(self.instances.get(&vm_id).unwrap().info())
+        Ok(instance.info())
     }
 
     fn list_vms(&self) -> Vec<VmInfo> {
@@ -512,8 +513,7 @@ impl VmInstance {
         );
     }
 
-    fn boot_vm(config: &VmConfig) -> VmManagerResult<BootArtifacts> {
-        let _ = config;
+    fn boot_vm(_config: &VmConfig) -> VmManagerResult<BootArtifacts> {
         Ok(boot::setup(KERNEL_PATH))
     }
 
@@ -692,33 +692,48 @@ impl VmInstance {
         next_token_count: &mut usize,
     ) -> VmManagerResult<bool> {
         match kind {
-            EventKind::Exit => {
-                println!("vcpu stopped, main loop exit for vm {}", self.id);
-                Ok(true)
-            }
+            EventKind::Exit => Ok(self.handle_exit()),
             EventKind::NetActivate => {
-                let _ = self.net.activate_evt.read().unwrap();
+                self.handle_net_activate()?;
                 self.register_tap_rx(vm_id, poll, routes, next_token_count)?;
                 Ok(false)
             }
-            EventKind::TapRx => {
-                let mut net = self.net.device.lock().unwrap();
-                let _ = net.process_rx();
-                Ok(false)
-            }
-            EventKind::NetQueue(idx) => {
-                let _ = self.net.queue_events[idx].read().unwrap();
-                let mut net = self.net.device.lock().unwrap();
-                let _ = net.process_tx();
-                Ok(false)
-            }
-            EventKind::BlkQueue(idx) => {
-                let _ = self.blk.queue_events[idx].read().unwrap();
-                let mut blk = self.blk.device.lock().unwrap();
-                let _ = blk.process_queue();
-                Ok(false)
-            }
+            EventKind::TapRx => Ok(self.handle_tap_rx()),
+            EventKind::NetQueue(idx) => Ok(self.handle_net_queue(idx)),
+            EventKind::BlkQueue(idx) => Ok(self.handle_blk_queue(idx)),
         }
+    }
+
+    fn handle_exit(&self) -> bool {
+        println!("vcpu stopped, main loop exit for vm {}", self.id);
+        true
+    }
+
+    fn handle_net_activate(&mut self) -> io::Result<()> {
+        self.net.activate_evt.read().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("failed to read activate event: {e}"))
+        })?;
+        Ok(())
+    }
+
+    fn handle_tap_rx(&mut self) -> bool {
+        let mut net = self.net.device.lock().unwrap();
+        let _ = net.process_rx();
+        false
+    }
+
+    fn handle_net_queue(&mut self, idx: usize) -> bool {
+        let _ = self.net.queue_events[idx].read();
+        let mut net = self.net.device.lock().unwrap();
+        let _ = net.process_tx();
+        false
+    }
+
+    fn handle_blk_queue(&mut self, idx: usize) -> bool {
+        let _ = self.blk.queue_events[idx].read();
+        let mut blk = self.blk.device.lock().unwrap();
+        let _ = blk.process_queue();
+        false
     }
 
     fn register_tap_rx(
@@ -737,8 +752,7 @@ impl VmInstance {
             .device
             .lock()
             .unwrap()
-            .register_tap_readable(poll, token)
-            .unwrap();
+            .register_tap_readable(poll, token)?;
         routes.insert(
             token,
             EventRoute {
@@ -853,11 +867,11 @@ impl VcpuStopper {
     }
 
     fn request_stop(&self) -> io::Result<()> {
-        if self.stop_requested.swap(true, Ordering::SeqCst) {
+        let was_already_set = self.stop_requested.swap(true, Ordering::SeqCst);
+        if was_already_set {
             return Ok(());
         }
 
-        let thread = self.thread.lock().unwrap();
         let kvm_run = self.kvm_run.load(Ordering::SeqCst);
         if !kvm_run.is_null() {
             unsafe {
@@ -865,16 +879,16 @@ impl VcpuStopper {
             }
         }
 
+        let thread = self.thread.lock().unwrap();
         let Some(thread) = *thread else {
             return Ok(());
         };
 
         let ret = unsafe { libc::pthread_kill(thread, VM_STOP_SIGNAL) };
-        if ret == 0 || ret == libc::ESRCH {
-            Ok(())
-        } else {
-            Err(io::Error::from_raw_os_error(ret))
+        if ret != 0 && ret != libc::ESRCH {
+            return Err(io::Error::from_raw_os_error(ret));
         }
+        Ok(())
     }
 
     fn stop_requested(&self) -> bool {
