@@ -13,6 +13,7 @@ use std::{
 };
 
 use kvm_ioctls::{IoEventAddress, VcpuExit, VmFd};
+use tracing::{debug, error, info, warn};
 use vm_memory::GuestMemoryMmap;
 use vm_superio::{Serial, Trigger};
 use vmm_sys_util::{
@@ -238,11 +239,16 @@ impl VmManager {
     }
 
     pub fn run(&mut self) -> VmManagerResult<()> {
+        info!("vm manager starting");
         self.manager_running.store(true, Ordering::SeqCst);
         let result = self.run_inner();
+        if let Err(err) = &result {
+            error!(error = %err, "vm manager run loop failed");
+        }
         self.cleanup_instances();
         self.cleanup_shared_host();
         self.manager_running.store(false, Ordering::SeqCst);
+        info!("vm manager stopped");
         result
     }
 
@@ -304,13 +310,16 @@ impl VmManager {
                     ssh_key,
                     response,
                 } => {
+                    info!(name = %name, "start vm command received");
                     let config = self.vm_config(name, ssh_key);
                     let _ = response.send(self.start_vm(config, poll, routes, next_token_count));
                 }
                 VmCommand::List { response } => {
+                    debug!("list vms command received");
                     let _ = response.send(Ok(self.list_vms()));
                 }
                 VmCommand::Stop { id, response } => {
+                    info!(id, "stop vm command received");
                     let _ = response.send(self.request_stop_vm(id));
                 }
             }
@@ -321,6 +330,7 @@ impl VmManager {
 
     fn request_stop_vm(&mut self, id: u8) -> VmManagerResult<()> {
         let instance = self.instances.get(&id).ok_or_else(|| {
+            warn!(id, "stop requested for missing vm");
             io::Error::new(io::ErrorKind::NotFound, format!("vm {id} is not running"))
         })?;
 
@@ -363,6 +373,7 @@ impl VmManager {
         routes: &mut HashMap<u8, EventRoute>,
         next_token_count: &mut usize,
     ) -> VmManagerResult<VmInfo> {
+        info!(vm_id = config.id(), name = %config.name(), "starting vm");
         if self.configs.contains_key(&config.id()) || self.instances.contains_key(&config.id()) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -373,14 +384,17 @@ impl VmManager {
 
         let had_instances = !self.instances.is_empty();
         if !self.shared_host_provisioned {
+            debug!("provisioning shared host");
             provision::provision_shared_host()?;
             self.shared_host_provisioned = true;
+            debug!("shared host provisioned");
         }
 
         let vm_id = config.id();
         let instance = match VmInstance::start(config) {
             Ok(instance) => instance,
             Err(err) => {
+                error!(vm_id, error = %err, "failed to start vm");
                 cleanup_vm_resources(vm_id);
                 if !had_instances {
                     self.cleanup_shared_host();
@@ -391,12 +405,8 @@ impl VmManager {
         self.instances.insert(vm_id, instance);
 
         let instance = self.instances.get(&vm_id).unwrap();
-        if let Err(err) = instance.register_events(
-            vm_id,
-            poll,
-            routes,
-            next_token_count,
-        ) {
+        if let Err(err) = instance.register_events(vm_id, poll, routes, next_token_count) {
+            error!(vm_id, error = %err, "failed to register vm events");
             self.cleanup_instance(vm_id, routes);
             if !had_instances {
                 self.cleanup_shared_host();
@@ -404,6 +414,7 @@ impl VmManager {
             return Err(err);
         }
 
+        info!(vm_id, "vm started");
         Ok(instance.info())
     }
 
@@ -418,13 +429,16 @@ impl VmManager {
     }
 
     fn cleanup_instance(&mut self, vm_id: u8, routes: &mut HashMap<u8, EventRoute>) {
+        info!(vm_id, "cleaning up vm");
         routes.retain(|_, route| route.vm_id != vm_id);
         self.instances.remove(&vm_id);
         cleanup_vm_resources(vm_id);
+        debug!(vm_id, "vm cleanup completed");
     }
 
     fn cleanup_instances(&mut self) {
         for vm_id in self.instances.keys().copied().collect::<Vec<_>>() {
+            info!(vm_id, "cleaning up vm");
             cleanup_vm_resources(vm_id);
         }
 
@@ -433,7 +447,10 @@ impl VmManager {
 
     fn cleanup_shared_host(&mut self) {
         if self.shared_host_provisioned {
-            let _ = provision::deprovision_shared_host();
+            debug!("cleaning up shared host");
+            if let Err(err) = provision::deprovision_shared_host() {
+                warn!(error = %err, "failed to deprovision shared host");
+            }
             self.shared_host_provisioned = false;
         }
     }
@@ -471,20 +488,34 @@ struct BlkDeviceRuntime {
 
 impl VmInstance {
     fn start(config: VmConfig) -> VmManagerResult<Self> {
+        let span = tracing::info_span!(
+            "vm",
+            vm_id = config.id(),
+            name = %config.name(),
+            guest_ip = %config.guest_ip()
+        );
+        let _entered = span.enter();
+
         install_stop_signal_handler()?;
 
-        Self::provision_vm(&config);
+        debug!("provisioning vm");
+        Self::provision_vm(&config)?;
 
+        debug!("booting vm");
         let BootArtifacts {
             vm,
             vcpu,
             guest_mem,
         } = Self::boot_vm(&config)?;
         let mut mmio_bus = MMIOBus::new();
+        debug!("creating net device");
         let net = Self::create_net_device(&config, &vm, &guest_mem, &mut mmio_bus);
+        debug!("creating block device");
         let blk = Self::create_blk_device(&config, &vm, &guest_mem, &mut mmio_bus);
+        debug!("creating serial device");
         let stdio_serial = Self::create_serial(&vm);
-        let (vcpu_stopper, exit_evt) = Self::start_vcpu(vcpu, stdio_serial, mmio_bus);
+        debug!("starting vcpu thread");
+        let (vcpu_stopper, exit_evt) = Self::start_vcpu(config.id(), vcpu, stdio_serial, mmio_bus);
 
         Ok(Self {
             id: config.id(),
@@ -499,18 +530,21 @@ impl VmInstance {
         })
     }
 
-    fn provision_vm(config: &VmConfig) {
-        provision::provision_vm_host(config.id()).expect("failed to provision host");
-        provision::provision_guest(config.id(), config.ssh_key().trim_end())
-            .expect("failed to provision guest");
+    fn provision_vm(config: &VmConfig) -> VmManagerResult<()> {
+        provision::provision_vm_host(config.id())?;
+        provision::provision_guest(config.id(), config.ssh_key().trim_end())?;
 
-        println!(
-            "Provisioned VM {}\n  rootfs: {}\n  tap: {}\n  guest ip: {}\n  gateway: 10.10.0.1\n  dns: 8.8.8.8",
-            config.id(),
-            config.rootfs_path().display(),
-            config.tap_name(),
-            config.guest_ip(),
+        info!(
+            vm_id = config.id(),
+            rootfs = %config.rootfs_path().display(),
+            tap = %config.tap_name(),
+            guest_ip = %config.guest_ip(),
+            gateway = "10.10.0.1",
+            dns = "8.8.8.8",
+            "provisioned vm"
         );
+
+        Ok(())
     }
 
     fn boot_vm(_config: &VmConfig) -> VmManagerResult<BootArtifacts> {
@@ -597,6 +631,7 @@ impl VmInstance {
     }
 
     fn start_vcpu(
+        vm_id: u8,
         vcpu: kvm_ioctls::VcpuFd,
         stdio_serial: Arc<Mutex<HostSerial>>,
         mmio_bus: MMIOBus,
@@ -604,6 +639,7 @@ impl VmInstance {
         let exit_evt = EventWrapper::new();
         let vcpu_stopper = VcpuStopper::new();
         spawn_vcpu_runtime(
+            vm_id,
             vcpu,
             stdio_serial,
             mmio_bus,
@@ -705,34 +741,47 @@ impl VmInstance {
     }
 
     fn handle_exit(&self) -> bool {
-        println!("vcpu stopped, main loop exit for vm {}", self.id);
+        info!(vm_id = self.id, "vcpu stopped");
         true
     }
 
     fn handle_net_activate(&mut self) -> io::Result<()> {
         self.net.activate_evt.read().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("failed to read activate event: {e}"))
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to read activate event: {e}"),
+            )
         })?;
         Ok(())
     }
 
     fn handle_tap_rx(&mut self) -> bool {
         let mut net = self.net.device.lock().unwrap();
-        let _ = net.process_rx();
+        if let Err(err) = net.process_rx() {
+            warn!(vm_id = self.id, error = %err, "failed to process net rx");
+        }
         false
     }
 
     fn handle_net_queue(&mut self, idx: usize) -> bool {
-        let _ = self.net.queue_events[idx].read();
+        if let Err(err) = self.net.queue_events[idx].read() {
+            warn!(vm_id = self.id, queue = idx, error = %err, "failed to read net queue event");
+        }
         let mut net = self.net.device.lock().unwrap();
-        let _ = net.process_tx();
+        if let Err(err) = net.process_tx() {
+            warn!(vm_id = self.id, queue = idx, error = %err, "failed to process net tx");
+        }
         false
     }
 
     fn handle_blk_queue(&mut self, idx: usize) -> bool {
-        let _ = self.blk.queue_events[idx].read();
+        if let Err(err) = self.blk.queue_events[idx].read() {
+            warn!(vm_id = self.id, queue = idx, error = %err, "failed to read block queue event");
+        }
         let mut blk = self.blk.device.lock().unwrap();
-        let _ = blk.process_queue();
+        if let Err(err) = blk.process_queue() {
+            warn!(vm_id = self.id, queue = idx, error = %err, "failed to process block queue");
+        }
         false
     }
 
@@ -761,17 +810,23 @@ impl VmInstance {
             },
         );
         self.tap_rx_registered = true;
+        debug!(vm_id, token, "registered tap rx event");
 
         Ok(())
     }
 }
 
 fn cleanup_vm_resources(vm_id: u8) {
-    let _ = provision::deprovision_guest(vm_id);
-    let _ = provision::deprovision_vm_host(vm_id);
+    if let Err(err) = provision::deprovision_guest(vm_id) {
+        warn!(vm_id, error = %err, "failed to deprovision guest resources");
+    }
+    if let Err(err) = provision::deprovision_vm_host(vm_id) {
+        warn!(vm_id, error = %err, "failed to deprovision vm host resources");
+    }
 }
 
 fn spawn_vcpu_runtime(
+    vm_id: u8,
     mut vcpu: kvm_ioctls::VcpuFd,
     stdio_serial: Arc<Mutex<HostSerial>>,
     mut mmio_bus: MMIOBus,
@@ -808,25 +863,26 @@ fn spawn_vcpu_runtime(
                         mmio_bus.write(addr, data);
                     }
                     VcpuExit::Hlt => {
-                        println!("KVM_EXIT_HLT");
+                        info!(vm_id, "vcpu halted");
                         break;
                     }
                     VcpuExit::Shutdown => {
-                        println!("KVM_EXIT_SHUTDOWN");
+                        info!(vm_id, "vcpu shutdown");
                         break;
                     }
                     r => {
-                        println!("KVM_EXIT: {:?}", r)
+                        debug!(vm_id, exit = ?r, "vcpu exit");
                     }
                 },
                 Err(e) => {
                     if vcpu_stopper.stop_requested()
                         && e == vmm_sys_util::errno::Error::new(libc::EINTR)
                     {
+                        debug!(vm_id, "vcpu interrupted for stop request");
                         break;
                     }
 
-                    println!("KVM Run error {:?}", e);
+                    error!(vm_id, error = ?e, "kvm run failed");
                     break;
                 }
             }
