@@ -12,7 +12,11 @@ use rocket::{
 };
 use tracing::{debug, info, warn};
 
-use crate::vm_manager::{VmInfo, VmManagerHandle};
+use crate::vm_manager::{VmInfo, VmManagerHandle, VmManagerResult};
+
+const MIN_MEMORY_MIB: u32 = 128;
+const MAX_MEMORY_MIB: u32 = 3072;
+const MEMORY_STEP_MIB: u32 = 128;
 
 const ALLOWED_ORIGINS: &[&str] = &[
     "http://127.0.0.1:5173",
@@ -26,6 +30,7 @@ struct VmResponse {
     id: u8,
     name: String,
     ip_address: String,
+    memory_mib: u32,
     status: &'static str,
 }
 
@@ -34,6 +39,7 @@ struct VmResponse {
 struct CreateVmRequest {
     name: String,
     ssh_key: String,
+    memory_mib: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,9 +76,15 @@ fn create_vm(
     handle: &State<VmManagerHandle>,
     request: Json<CreateVmRequest>,
 ) -> ApiResult<VmResponse> {
-    info!(name = %request.name, "create vm requested");
+    validate_memory_mib(request.memory_mib).map_err(api_error)?;
+
+    info!(name = %request.name, memory_mib = request.memory_mib, "create vm requested");
     let vm = handle
-        .start_vm(request.name.clone(), request.ssh_key.clone())
+        .start_vm(
+            request.name.clone(),
+            request.ssh_key.clone(),
+            request.memory_mib,
+        )
         .map_err(api_error)?;
 
     Ok(Json(VmResponse::from(vm)))
@@ -139,9 +151,30 @@ impl From<VmInfo> for VmResponse {
             id: vm.id,
             name: vm.name,
             ip_address: vm.ip_address,
+            memory_mib: vm.memory_mib,
             status: vm.status,
         }
     }
+}
+
+fn validate_memory_mib(memory_mib: u32) -> VmManagerResult<()> {
+    if !(MIN_MEMORY_MIB..=MAX_MEMORY_MIB).contains(&memory_mib) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("memory_mib must be between {MIN_MEMORY_MIB} and {MAX_MEMORY_MIB}"),
+        )
+        .into());
+    }
+
+    if memory_mib % MEMORY_STEP_MIB != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("memory_mib must be a multiple of {MEMORY_STEP_MIB}"),
+        )
+        .into());
+    }
+
+    Ok(())
 }
 
 fn api_error(err: Box<dyn std::error::Error + Send + Sync>) -> status::Custom<Json<ApiError>> {
