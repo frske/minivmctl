@@ -7,19 +7,52 @@ KEY="$ROOT/certs/localhost-key.pem"
 BACKEND_BIN="$ROOT/target/debug/scratch-new"
 ROCKET_CONFIG="$ROOT/Rocket.toml"
 FRONTEND_PORT="5173"
+BACKEND_STOP_WAIT_SECONDS="35"
+FRONTEND_STOP_WAIT_SECONDS="2"
 
 backend_pid=""
 frontend_pid=""
+
+stop_process() {
+    local pid="$1"
+    local use_sudo="$2"
+    local wait_seconds="$3"
+    local attempts=$((wait_seconds * 10))
+
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+        return
+    fi
+
+    if [[ "$use_sudo" == "yes" ]]; then
+        sudo kill -TERM "$pid" >/dev/null 2>&1 || true
+    else
+        kill -TERM "$pid" >/dev/null 2>&1 || true
+    fi
+
+    for ((i = 0; i < attempts; i++)); do
+        if ! kill -0 "$pid" >/dev/null 2>&1; then
+            return
+        fi
+        sleep 0.1
+    done
+
+    if [[ "$use_sudo" == "yes" ]]; then
+        sudo kill -KILL "$pid" >/dev/null 2>&1 || true
+    else
+        kill -KILL "$pid" >/dev/null 2>&1 || true
+    fi
+}
 
 cleanup() {
     set +e
 
     if [[ -n "$backend_pid" ]]; then
-        sudo kill "$backend_pid" >/dev/null 2>&1 || true
+        printf 'waiting up to %ss for backend shutdown...\n' "$BACKEND_STOP_WAIT_SECONDS"
+        stop_process "$backend_pid" yes "$BACKEND_STOP_WAIT_SECONDS"
     fi
 
     if [[ -n "$frontend_pid" ]]; then
-        kill "$frontend_pid" >/dev/null 2>&1 || true
+        stop_process "$frontend_pid" no "$FRONTEND_STOP_WAIT_SECONDS"
     fi
 }
 

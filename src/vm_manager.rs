@@ -9,7 +9,8 @@ use std::{
         atomic::{AtomicBool, AtomicPtr, Ordering},
         mpsc,
     },
-    time::Duration,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use kvm_ioctls::{IoEventAddress, VcpuExit, VmFd};
@@ -56,6 +57,9 @@ enum VmCommand {
     },
     Stop {
         id: u8,
+        response: mpsc::Sender<VmManagerResult<()>>,
+    },
+    Shutdown {
         response: mpsc::Sender<VmManagerResult<()>>,
     },
 }
@@ -111,6 +115,26 @@ impl VmManagerHandle {
             Duration::from_secs(5),
             |response| VmCommand::Stop { id, response },
         )
+    }
+
+    pub fn shutdown(&self) -> VmManagerResult<()> {
+        self.send_command(
+            "vm manager is not running",
+            Duration::from_secs(5),
+            |response| VmCommand::Shutdown { response },
+        )
+    }
+
+    pub fn wait_until_running(&self, timeout: Duration) -> VmManagerResult<()> {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if self.manager_running.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        Err(io::Error::new(io::ErrorKind::TimedOut, "vm manager did not start").into())
     }
 
     fn send_command<T>(
@@ -217,6 +241,7 @@ pub struct VmManager {
     command_evt: Arc<EventWrapper>,
     manager_running: Arc<AtomicBool>,
     next_vm_id: u8,
+    shutting_down: bool,
 }
 
 impl VmManager {
@@ -231,6 +256,7 @@ impl VmManager {
             command_evt: Arc::new(EventWrapper::new()),
             manager_running: Arc::new(AtomicBool::new(false)),
             next_vm_id: 0,
+            shutting_down: false,
         }
     }
 
@@ -284,6 +310,9 @@ impl VmManager {
             for event in events.iter_readable() {
                 if event.token() == COMMAND_TOKEN {
                     self.handle_commands(&poll, &mut routes, &mut next_token_count)?;
+                    if self.should_exit() {
+                        return Ok(());
+                    }
                     continue;
                 }
 
@@ -306,6 +335,9 @@ impl VmManager {
                     self.cleanup_instance(route.vm_id, &mut routes);
                     if self.instances.is_empty() {
                         self.cleanup_shared_host();
+                        if self.should_exit() {
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -329,6 +361,14 @@ impl VmManager {
                     response,
                 } => {
                     info!(name = %name, memory_mib, "start vm command received");
+                    if self.shutting_down {
+                        let _ = response.send(Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "vm manager is shutting down",
+                        )
+                        .into()));
+                        continue;
+                    }
                     let config = self.vm_config(name, ssh_key, memory_mib);
                     let _ = response.send(self.start_vm(config, poll, routes, next_token_count));
                 }
@@ -340,10 +380,38 @@ impl VmManager {
                     info!(id, "stop vm command received");
                     let _ = response.send(self.request_stop_vm(id));
                 }
+                VmCommand::Shutdown { response } => {
+                    info!("shutdown command received");
+                    self.shutting_down = true;
+                    let _ = response.send(self.request_stop_all_vms());
+                }
             }
         }
 
         Ok(())
+    }
+
+    fn should_exit(&self) -> bool {
+        self.shutting_down && self.instances.is_empty()
+    }
+
+    fn request_stop_all_vms(&mut self) -> VmManagerResult<()> {
+        let mut first_error = None;
+
+        for (&id, instance) in &self.instances {
+            if let Err(err) = instance.request_stop() {
+                warn!(vm_id = id, error = %err, "failed to request vm stop during shutdown");
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+
+        if let Some(err) = first_error {
+            Err(err)
+        } else {
+            Ok(())
+        }
     }
 
     fn request_stop_vm(&mut self, id: u8) -> VmManagerResult<()> {
@@ -455,18 +523,25 @@ impl VmManager {
     fn cleanup_instance(&mut self, vm_id: u8, routes: &mut HashMap<u8, EventRoute>) {
         info!(vm_id, "cleaning up vm");
         routes.retain(|_, route| route.vm_id != vm_id);
-        self.instances.remove(&vm_id);
+        if let Some(mut instance) = self.instances.remove(&vm_id) {
+            instance.join_vcpu_thread();
+        }
         cleanup_vm_resources(vm_id);
         debug!(vm_id, "vm cleanup completed");
     }
 
     fn cleanup_instances(&mut self) {
-        for vm_id in self.instances.keys().copied().collect::<Vec<_>>() {
-            info!(vm_id, "cleaning up vm");
-            cleanup_vm_resources(vm_id);
+        for (&vm_id, instance) in &self.instances {
+            if let Err(err) = instance.request_stop() {
+                warn!(vm_id, error = %err, "failed to request vm stop during cleanup");
+            }
         }
 
-        self.instances.clear();
+        for (vm_id, mut instance) in self.instances.drain() {
+            info!(vm_id, "cleaning up vm");
+            instance.join_vcpu_thread();
+            cleanup_vm_resources(vm_id);
+        }
     }
 
     fn cleanup_shared_host(&mut self) {
@@ -494,6 +569,7 @@ struct VmInstance {
     memory_mib: u32,
     _vm: VmFd,
     vcpu_stopper: VcpuStopper,
+    vcpu_thread: Option<JoinHandle<()>>,
     net: NetDeviceRuntime,
     blk: BlkDeviceRuntime,
     exit_evt: EventWrapper,
@@ -541,7 +617,8 @@ impl VmInstance {
         debug!("creating serial device");
         let stdio_serial = Self::create_serial(&vm);
         debug!("starting vcpu thread");
-        let (vcpu_stopper, exit_evt) = Self::start_vcpu(config.id(), vcpu, stdio_serial, mmio_bus);
+        let (vcpu_stopper, vcpu_thread, exit_evt) =
+            Self::start_vcpu(config.id(), vcpu, stdio_serial, mmio_bus);
 
         Ok(Self {
             id: config.id(),
@@ -550,6 +627,7 @@ impl VmInstance {
             memory_mib: config.memory_mib(),
             _vm: vm,
             vcpu_stopper,
+            vcpu_thread: Some(vcpu_thread),
             net,
             blk,
             exit_evt,
@@ -662,10 +740,10 @@ impl VmInstance {
         vcpu: kvm_ioctls::VcpuFd,
         stdio_serial: Arc<Mutex<HostSerial>>,
         mmio_bus: MMIOBus,
-    ) -> (VcpuStopper, EventWrapper) {
+    ) -> (VcpuStopper, JoinHandle<()>, EventWrapper) {
         let exit_evt = EventWrapper::new();
         let vcpu_stopper = VcpuStopper::new();
-        spawn_vcpu_runtime(
+        let vcpu_thread = spawn_vcpu_runtime(
             vm_id,
             vcpu,
             stdio_serial,
@@ -674,7 +752,7 @@ impl VmInstance {
             vcpu_stopper.clone(),
         );
 
-        (vcpu_stopper, exit_evt)
+        (vcpu_stopper, vcpu_thread, exit_evt)
     }
 
     fn request_stop(&self) -> VmManagerResult<()> {
@@ -689,6 +767,14 @@ impl VmInstance {
             ip_address: self.ip_address.clone(),
             memory_mib: self.memory_mib,
             status: "running",
+        }
+    }
+
+    fn join_vcpu_thread(&mut self) {
+        if let Some(thread) = self.vcpu_thread.take() {
+            if thread.join().is_err() {
+                warn!(vm_id = self.id, "vcpu thread panicked during cleanup");
+            }
         }
     }
 
@@ -860,8 +946,8 @@ fn spawn_vcpu_runtime(
     mut mmio_bus: MMIOBus,
     vcpu_exit_evt: EventWrapper,
     vcpu_stopper: VcpuStopper,
-) {
-    std::thread::spawn(move || {
+) -> JoinHandle<()> {
+    thread::spawn(move || {
         unblock_stop_signal();
         vcpu_stopper.set_thread();
         vcpu_stopper.set_kvm_run(vcpu.get_kvm_run() as *mut _);
@@ -916,8 +1002,10 @@ fn spawn_vcpu_runtime(
             }
         }
         vcpu_stopper.clear_thread();
-        vcpu_exit_evt.trigger().unwrap();
-    });
+        if let Err(err) = vcpu_exit_evt.trigger() {
+            error!(vm_id, error = %err, "failed to signal vcpu exit");
+        }
+    })
 }
 
 #[derive(Clone)]
@@ -1141,11 +1229,85 @@ mod tests {
     }
 
     #[test]
+    fn handle_commands_marks_manager_shutting_down() {
+        let mut manager = VmManager::new();
+        let poll: PollContext<u8> = PollContext::new().unwrap();
+        let mut routes = HashMap::new();
+        let mut next_token_count = 0;
+        let (response_tx, response_rx) = mpsc::channel();
+
+        manager
+            .command_tx
+            .send(VmCommand::Shutdown {
+                response: response_tx,
+            })
+            .unwrap();
+
+        manager
+            .handle_commands(&poll, &mut routes, &mut next_token_count)
+            .unwrap();
+
+        response_rx.recv().unwrap().unwrap();
+        assert!(manager.shutting_down);
+        assert!(manager.should_exit());
+    }
+
+    #[test]
+    fn handle_commands_rejects_start_after_shutdown() {
+        let mut manager = VmManager::new();
+        let poll: PollContext<u8> = PollContext::new().unwrap();
+        let mut routes = HashMap::new();
+        let mut next_token_count = 0;
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let (start_tx, start_rx) = mpsc::channel();
+
+        manager
+            .command_tx
+            .send(VmCommand::Shutdown {
+                response: shutdown_tx,
+            })
+            .unwrap();
+        manager
+            .command_tx
+            .send(VmCommand::Start {
+                name: "test-vm".to_string(),
+                ssh_key: "ssh-ed25519 test".to_string(),
+                memory_mib: 512,
+                response: start_tx,
+            })
+            .unwrap();
+
+        manager
+            .handle_commands(&poll, &mut routes, &mut next_token_count)
+            .unwrap();
+
+        shutdown_rx.recv().unwrap().unwrap();
+        let err = start_rx.recv().unwrap().unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<io::Error>().unwrap().kind(),
+            ErrorKind::NotConnected
+        );
+    }
+
+    #[test]
     fn handle_request_stop_vm_rejects_when_manager_is_not_running() {
         let manager = VmManager::new();
         let handle = manager.handle().unwrap();
 
         let err = handle.request_stop_vm(1).unwrap_err();
+
+        assert_eq!(
+            err.downcast_ref::<io::Error>().unwrap().kind(),
+            ErrorKind::NotConnected
+        );
+    }
+
+    #[test]
+    fn handle_shutdown_rejects_when_manager_is_not_running() {
+        let manager = VmManager::new();
+        let handle = manager.handle().unwrap();
+
+        let err = handle.shutdown().unwrap_err();
 
         assert_eq!(
             err.downcast_ref::<io::Error>().unwrap().kind(),
