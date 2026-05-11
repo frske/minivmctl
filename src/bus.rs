@@ -74,6 +74,15 @@ where
     }
 }
 
+impl<A, D> Default for Bus<A, D>
+where
+    A: PartialOrd<A>,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub trait DeviceIO {
     type Offset;
     fn read(&mut self, offset: Self::Offset, data: &mut [u8]);

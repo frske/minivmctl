@@ -108,15 +108,13 @@ impl ConfigSpace {
     // }
 }
 
+#[derive(Default)]
 enum DeviceState {
+    #[default]
     Inactive,
-    Activated { mem: GuestMemoryMmap },
-}
-
-impl Default for DeviceState {
-    fn default() -> Self {
-        Self::Inactive
-    }
+    Activated {
+        mem: GuestMemoryMmap,
+    },
 }
 
 impl DeviceState {
@@ -172,14 +170,14 @@ impl Tap {
 
         let mut cname = [0; IFNAMSIZ];
 
-        if name.as_bytes().len() >= IFNAMSIZ {
+        if name.len() >= IFNAMSIZ {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "interface name too long",
             ));
         }
 
-        cname[..name.as_bytes().len()].copy_from_slice(name.as_bytes());
+        cname[..name.len()].copy_from_slice(name.as_bytes());
 
         let mut ifr = ifreq {
             ifr_name: unsafe { transmute::<[u8; IFNAMSIZ], [libc::c_char; IFNAMSIZ]>(cname) },
@@ -276,18 +274,13 @@ where
                     iov_base: desc
                         .mem
                         .get_slice(GuestAddress(desc.addr), desc.len as usize)
-                        .map_err(|_| {
-                            io::Error::new(io::ErrorKind::Other, "Failed to get slice iovec")
-                        })?
+                        .map_err(|_| io::Error::other("Failed to get slice iovec"))?
                         .ptr_guard_mut()
                         .as_ptr() as *mut _,
                     iov_len: desc.len as _,
                 });
             } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Descriptor write_only bit not matches",
-                ));
+                return Err(io::Error::other("Descriptor write_only bit not matches"));
             }
             next_desc = desc.next();
         }
@@ -417,12 +410,7 @@ where
 
         let mut try_notify = false;
 
-        loop {
-            let desc = match queue.pop(&mem) {
-                Ok(Some(x)) => x,
-                Ok(None) | Err(_) => break,
-            };
-
+        while let Ok(Some(desc)) = queue.pop(&mem) {
             let desc_index = desc.index;
             let write_succeeded = self.tap.writev(desc).is_ok();
             queue.push(&mem, desc_index, 0);

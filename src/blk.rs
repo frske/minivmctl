@@ -324,15 +324,13 @@ impl ConfigSpace {
     }
 }
 
+#[derive(Default)]
 enum DeviceState {
+    #[default]
     Inactive,
-    Activated { mem: GuestMemoryMmap },
-}
-
-impl Default for DeviceState {
-    fn default() -> Self {
-        Self::Inactive
-    }
+    Activated {
+        mem: GuestMemoryMmap,
+    },
 }
 
 impl DeviceState {
@@ -402,12 +400,7 @@ impl Blk {
             .expect("process_queue called before device activation");
         let mut try_notify = false;
 
-        loop {
-            let desc = match self.queues[0].pop(&mem) {
-                Ok(Some(desc)) => desc,
-                Ok(None) | Err(_) => break,
-            };
-
+        while let Ok(Some(desc)) = self.queues[0].pop(&mem) {
             let desc_index = desc.index;
             let request = match Request::parse(desc) {
                 Ok(request) => request,
@@ -452,7 +445,7 @@ impl Blk {
         let total_len = request.total_data_len();
 
         if matches!(request_type, RequestType::In | RequestType::Out)
-            && total_len % SECTOR_SIZE != 0
+            && !total_len.is_multiple_of(SECTOR_SIZE)
         {
             return Err(ExecuteError::InvalidDataLength);
         }

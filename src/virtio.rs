@@ -25,6 +25,11 @@ struct Descriptor {
 }
 unsafe impl ByteValued for Descriptor {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueError {
+    InvalidDescriptorIndex { index: u16, queue_size: u16 },
+}
+
 #[derive(Clone)]
 pub struct DescriptorChain<M> {
     pub(crate) mem: M,
@@ -43,10 +48,15 @@ where
     M: Deref,
     M::Target: GuestMemoryBackend,
 {
-    pub fn new(mem: M, desc_table: GuestAddress, queue_size: u16, index: u16) -> Result<Self, ()> {
+    pub fn new(
+        mem: M,
+        desc_table: GuestAddress,
+        queue_size: u16,
+        index: u16,
+    ) -> Result<Self, QueueError> {
         if index >= queue_size {
             tracing::warn!(index, queue_size, "invalid descriptor index");
-            return Err(());
+            return Err(QueueError::InvalidDescriptorIndex { index, queue_size });
         }
         Ok(Self::new_unchecked(mem, desc_table, queue_size, index))
     }
@@ -108,9 +118,7 @@ where
                 let to_copy = data.len().min(desc.len as usize - skip);
                 desc.mem
                     .write_slice(&data[..to_copy], GuestAddress(desc.addr + skip as u64))
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::Other, "Failed to write slice in mem")
-                    })?;
+                    .map_err(|_| io::Error::other("Failed to write slice in mem"))?;
                 data = &data[to_copy..];
                 if data.is_empty() {
                     return Ok(());
@@ -118,10 +126,7 @@ where
             }
             next_desc = desc.next();
         }
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            "Failed to write slice",
-        ))
+        Err(io::Error::other("Failed to write slice"))
     }
 }
 
@@ -160,7 +165,7 @@ impl Queue {
     pub fn pop<M: Deref<Target = impl GuestMemoryBackend>>(
         &mut self,
         mem: M,
-    ) -> Result<Option<DescriptorChain<M>>, ()> {
+    ) -> Result<Option<DescriptorChain<M>>, QueueError> {
         fence(Ordering::Acquire);
         if self.has_pending_entries(&mem) {
             return self.pop_unchecked(mem).map(Some);
@@ -241,9 +246,9 @@ impl Queue {
             && self.size != 0
             && self.size.is_power_of_two()
             && self.size <= 32768
-            && self.desc_table.raw_value() % 16 == 0
-            && self.avail_ring.raw_value() % 4 == 0
-            && self.used_ring.raw_value() % 2 == 0
+            && self.desc_table.raw_value().is_multiple_of(16)
+            && self.avail_ring.raw_value().is_multiple_of(4)
+            && self.used_ring.raw_value().is_multiple_of(2)
             && self.region_accessible(mem, self.desc_table, self.size as usize * 16)
             && self.region_accessible(mem, self.avail_ring, self.size as usize * 2 + 6)
             && self.region_accessible(mem, self.used_ring, self.size as usize * 8 + 6)
@@ -261,17 +266,14 @@ impl Queue {
     fn pop_unchecked<M: Deref<Target = impl GuestMemoryBackend>>(
         &mut self,
         mem: M,
-    ) -> Result<DescriptorChain<M>, ()> {
+    ) -> Result<DescriptorChain<M>, QueueError> {
         let addr = self
             .avail_ring
             .unchecked_add((u64::from(self.next_avail.0 % self.size) * 2) + 4);
         let desc_index = mem.read_obj::<u16>(addr).unwrap();
-        let desc_chain = DescriptorChain::new(mem, self.desc_table, self.size, desc_index);
-        if desc_chain.is_err() {
-            return desc_chain;
-        }
+        let desc_chain = DescriptorChain::new(mem, self.desc_table, self.size, desc_index)?;
         self.next_avail += 1;
-        desc_chain
+        Ok(desc_chain)
     }
 
     fn avail_idx<M: GuestMemoryBackend>(&self, mem: &M) -> Wrapping<u16> {
@@ -377,7 +379,17 @@ mod tests {
     fn descriptor_chain_rejects_invalid_index() {
         let mem = guest_memory(0x10_000);
 
-        assert!(DescriptorChain::new(&mem, GuestAddress(0x1000), 2, 2).is_err());
+        let err = match DescriptorChain::new(&mem, GuestAddress(0x1000), 2, 2) {
+            Ok(_) => panic!("expected invalid descriptor index"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            QueueError::InvalidDescriptorIndex {
+                index: 2,
+                queue_size: 2,
+            }
+        );
     }
 
     // Chain follows NEXT bit.
@@ -584,7 +596,17 @@ mod tests {
         write_u16(&mem, queue.avail_ring.unchecked_add(2), 1);
         write_u16(&mem, queue.avail_ring.unchecked_add(4), 99);
 
-        assert!(queue.pop(&mem).is_err());
+        let err = match queue.pop(&mem) {
+            Ok(_) => panic!("expected invalid descriptor index"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            QueueError::InvalidDescriptorIndex {
+                index: 99,
+                queue_size: 8,
+            }
+        );
         assert_eq!(queue.next_avail.0, 0);
     }
 

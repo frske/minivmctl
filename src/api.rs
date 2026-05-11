@@ -168,7 +168,7 @@ fn validate_memory_mib(memory_mib: u32) -> VmManagerResult<()> {
         .into());
     }
 
-    if memory_mib % MEMORY_STEP_MIB != 0 {
+    if !memory_mib.is_multiple_of(MEMORY_STEP_MIB) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("memory_mib must be a multiple of {MEMORY_STEP_MIB}"),

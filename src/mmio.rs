@@ -194,7 +194,7 @@ impl MMIOTransport {
                 }
             };
             data.copy_from_slice(v.to_le_bytes().as_slice());
-        } else if offset >= CONFIG_SPACE_OFFSET && offset <= 0xfff {
+        } else if (CONFIG_SPACE_OFFSET..=0xfff).contains(&offset) {
             self.device
                 .lock()
                 .unwrap()
@@ -221,27 +221,24 @@ impl MMIOTransport {
             let v = u32::from_le_bytes(buf);
             match offset {
                 0x14 => self.features_select = v,
-                0x20 => {
-                    if self.check_device_status(
-                        device_status::DRIVER,
-                        device_status::FEATURES_OK
-                            | device_status::FAILED
-                            | device_status::DEVICE_NEEDS_RESET,
-                    ) {
-                        self.device
-                            .lock()
-                            .unwrap()
-                            .ack_features_by_page(self.acked_features_select, v);
-                    }
+                0x20 if self.check_device_status(
+                    device_status::DRIVER,
+                    device_status::FEATURES_OK
+                        | device_status::FAILED
+                        | device_status::DEVICE_NEEDS_RESET,
+                ) =>
+                {
+                    self.device
+                        .lock()
+                        .unwrap()
+                        .ack_features_by_page(self.acked_features_select, v);
                 }
                 0x24 => self.acked_features_select = v,
                 0x30 => self.queue_select = v,
                 0x38 => self.update_queue_field(|q| q.size = (v & 0xffff) as u16),
                 0x44 => self.update_queue_field(|q| q.ready = v == 1),
-                0x64 => {
-                    if self.check_device_status(device_status::DRIVER_OK, 0) {
-                        self.interrupt_status.fetch_and(!v, Ordering::SeqCst);
-                    }
+                0x64 if self.check_device_status(device_status::DRIVER_OK, 0) => {
+                    self.interrupt_status.fetch_and(!v, Ordering::SeqCst);
                 }
                 0x70 => self.set_device_status(v),
                 0x80 => self.update_queue_field(|q| set_low32(&mut q.desc_table, v)),
@@ -252,17 +249,17 @@ impl MMIOTransport {
                 0xa4 => self.update_queue_field(|q| set_high32(&mut q.used_ring, v)),
                 _ => {}
             }
-        } else if offset >= CONFIG_SPACE_OFFSET && offset <= 0xfff {
-            if self.check_device_status(
+        } else if (CONFIG_SPACE_OFFSET..=0xfff).contains(&offset)
+            && self.check_device_status(
                 device_status::DRIVER,
                 device_status::FAILED | device_status::DEVICE_NEEDS_RESET,
-            ) {
-                self.device
-                    .lock()
-                    .unwrap()
-                    .write_config((offset - CONFIG_SPACE_OFFSET) as u32, data);
-                self.config_generation += 1;
-            }
+            )
+        {
+            self.device
+                .lock()
+                .unwrap()
+                .write_config((offset - CONFIG_SPACE_OFFSET) as u32, data);
+            self.config_generation += 1;
         }
     }
 

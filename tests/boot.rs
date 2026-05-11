@@ -1,11 +1,10 @@
 use kvm_bindings::kvm_segment;
 use linux_loader::bootparam::boot_params;
 use scratch_new::boot::{
-    BOOT_CMD, BOOT_CMD_START, BOOT_GDT_OFFSET, E820_RAM, EBDA_START, FIRST_ADDR_PAST_32BITS,
-    HIMEM_START, KERNEL_BOOT_FLAG_MAGIC_NUMBER, KERNEL_HDR_MAGIC_NUMBER,
-    KERNEL_MIN_ALIGNMENT_BYTES, KERNEL_TYPE_OF_LOADER, MEMORY_SIZE, MMIO_MEM_START,
-    ZERO_PAGE_START, add_e820_entry, load_boot_cmdline, seg_with_st, to_gdt_entry,
-    write_boot_params, write_gdt, write_page_tables,
+    BOOT_CMD, BOOT_CMD_START, BOOT_GDT_OFFSET, E820_RAM, EBDA_START, HIMEM_START,
+    KERNEL_BOOT_FLAG_MAGIC_NUMBER, KERNEL_HDR_MAGIC_NUMBER, KERNEL_MIN_ALIGNMENT_BYTES,
+    KERNEL_TYPE_OF_LOADER, MEMORY_SIZE, ZERO_PAGE_START, add_e820_entry, load_boot_cmdline,
+    seg_with_st, to_gdt_entry, write_boot_params, write_gdt, write_page_tables,
 };
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
@@ -159,5 +158,4 @@ fn write_boot_params_sets_linux_header_and_memory_map() {
         e820_entry(&params, 1),
         (HIMEM_START, MEMORY_SIZE as u64 - HIMEM_START, E820_RAM)
     );
-    assert!(FIRST_ADDR_PAST_32BITS > MMIO_MEM_START);
 }

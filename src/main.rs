@@ -9,7 +9,7 @@ const MANAGER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const MANAGER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[rocket::main]
-async fn main() -> Result<(), rocket::Error> {
+async fn main() -> Result<(), Box<rocket::Error>> {
     init_tracing();
 
     let mut manager = VmManager::new();
@@ -44,7 +44,7 @@ async fn main() -> Result<(), rocket::Error> {
         Err(mpsc::RecvTimeoutError::Disconnected) => error!("vm manager thread panicked"),
     }
 
-    launch_result.map(|_| ())
+    launch_result.map(|_| ()).map_err(Box::new)
 }
 
 fn init_tracing() {

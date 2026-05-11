@@ -164,7 +164,7 @@ pub fn configure_irq_and_pit(vm: &VmFd) {
         ..Default::default()
     };
     vm.create_pit2(pit_config).unwrap();
-    vm.set_tss_address(KVM_TSS_ADDRESS as usize)
+    vm.set_tss_address(KVM_TSS_ADDRESS)
         .expect("failed to set tss");
 }
 
@@ -261,7 +261,7 @@ pub fn write_boot_params(guest_mem: &GuestMemoryMmap<()>) {
     }
 
     if last_addr < end_32bit_gap_start {
-        let extended_size = last_addr.unchecked_offset_from(himem_start) as u64 + 1;
+        let extended_size = last_addr.unchecked_offset_from(himem_start) + 1;
         params.e820_table[params.e820_entries as usize - 1].size = extended_size;
     }
 

@@ -20,6 +20,12 @@ impl EventWrapper {
     }
 }
 
+impl Default for EventWrapper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Deref for EventWrapper {
     type Target = EventFd;
 

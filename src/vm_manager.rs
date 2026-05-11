@@ -555,6 +555,12 @@ impl VmManager {
     }
 }
 
+impl Default for VmManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for VmManager {
     fn drop(&mut self) {
         self.cleanup_instances();
@@ -771,10 +777,10 @@ impl VmInstance {
     }
 
     fn join_vcpu_thread(&mut self) {
-        if let Some(thread) = self.vcpu_thread.take() {
-            if thread.join().is_err() {
-                warn!(vm_id = self.id, "vcpu thread panicked during cleanup");
-            }
+        if let Some(thread) = self.vcpu_thread.take()
+            && thread.join().is_err()
+        {
+            warn!(vm_id = self.id, "vcpu thread panicked during cleanup");
         }
     }
 
@@ -860,12 +866,10 @@ impl VmInstance {
     }
 
     fn handle_net_activate(&mut self) -> io::Result<()> {
-        self.net.activate_evt.read().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("failed to read activate event: {e}"),
-            )
-        })?;
+        self.net
+            .activate_evt
+            .read()
+            .map_err(|e| io::Error::other(format!("failed to read activate event: {e}")))?;
         Ok(())
     }
 
