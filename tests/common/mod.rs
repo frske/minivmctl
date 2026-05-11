@@ -1,6 +1,6 @@
 use std::{fmt::Debug, sync::{Arc, Mutex}};
 
-use scratch_new::bus::DeviceIO;
+use minivmctl::bus::DeviceIO;
 use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
 
 #[derive(Default, Debug)]

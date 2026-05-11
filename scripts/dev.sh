@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CERT="$ROOT/certs/localhost.pem"
 KEY="$ROOT/certs/localhost-key.pem"
-BACKEND_BIN="$ROOT/target/debug/scratch-new"
+BACKEND_BIN="$ROOT/target/debug/minivmctl"
 ROCKET_CONFIG="$ROOT/Rocket.toml"
 FRONTEND_PORT="5173"
 BACKEND_STOP_WAIT_SECONDS="35"
@@ -91,7 +91,7 @@ printf 'starting backend: https://127.0.0.1:8443\n'
         ROCKET_CONFIG="$ROCKET_CONFIG" \
         ROCKET_TLS_CERTS="$CERT" \
         ROCKET_TLS_KEY="$KEY" \
-        ./scratch-new
+        ./minivmctl
 ) &
 backend_pid="$!"
 

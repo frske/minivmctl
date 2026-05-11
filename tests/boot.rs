@@ -1,6 +1,6 @@
 use kvm_bindings::kvm_segment;
 use linux_loader::bootparam::boot_params;
-use scratch_new::boot::{
+use minivmctl::boot::{
     BOOT_CMD, BOOT_CMD_START, BOOT_GDT_OFFSET, E820_RAM, EBDA_START, HIMEM_START,
     KERNEL_BOOT_FLAG_MAGIC_NUMBER, KERNEL_HDR_MAGIC_NUMBER, KERNEL_MIN_ALIGNMENT_BYTES,
     KERNEL_TYPE_OF_LOADER, MEMORY_SIZE, ZERO_PAGE_START, add_e820_entry, load_boot_cmdline,

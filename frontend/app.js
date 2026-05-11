@@ -1,5 +1,5 @@
 const API_BASE = "https://127.0.0.1:8443";
-const SSH_KEY_STORAGE_KEY = "scratch.vm.sshPublicKey";
+const SSH_KEY_STORAGE_KEY = "minivmctl.sshPublicKey";
 
 const form = document.querySelector("#create-form");
 const nameInput = document.querySelector("#name");

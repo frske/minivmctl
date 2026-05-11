@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use scratch_new::event::{EventHandlerMut, EventLoop, EventWrapper};
+use minivmctl::event::{EventHandlerMut, EventLoop, EventWrapper};
 use vm_superio::Trigger;
 use vmm_sys_util::epoll::EventSet;
 

@@ -1,10 +1,10 @@
 use std::{sync::mpsc, thread, time::Duration};
 
-use scratch_new::vm_manager::VmManager;
+use minivmctl::vm_manager::VmManager;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_LOG_FILTER: &str = "scratch_new=info,rocket=warn";
+const DEFAULT_LOG_FILTER: &str = "minivmctl=info,rocket=warn";
 const MANAGER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const MANAGER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<rocket::Error>> {
     }
 
     info!("launching api server");
-    let launch_result = scratch_new::api::rocket(handle).launch().await;
+    let launch_result = minivmctl::api::rocket(handle).launch().await;
 
     info!("api server stopped, shutting down vm manager");
     if let Err(err) = shutdown_handle.shutdown() {

@@ -715,6 +715,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
+name = "minivmctl"
+version = "0.1.0"
+dependencies = [
+ "iptables",
+ "kvm-bindings",
+ "kvm-ioctls",
+ "libc",
+ "linux-loader",
+ "netdev",
+ "nix",
+ "rocket",
+ "rust-ini",
+ "serde",
+ "serde_json",
+ "slab",
+ "tiny_http",
+ "tracing",
+ "tracing-subscriber",
+ "vm-memory",
+ "vm-superio",
+ "vmm-sys-util",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1247,30 +1271,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "scratch-new"
-version = "0.1.0"
-dependencies = [
- "iptables",
- "kvm-bindings",
- "kvm-ioctls",
- "libc",
- "linux-loader",
- "netdev",
- "nix",
- "rocket",
- "rust-ini",
- "serde",
- "serde_json",
- "slab",
- "tiny_http",
- "tracing",
- "tracing-subscriber",
- "vm-memory",
- "vm-superio",
- "vmm-sys-util",
-]
 
 [[package]]
 name = "sct"
