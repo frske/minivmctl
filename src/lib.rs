@@ -7,5 +7,5 @@ pub mod mmio;
 pub mod net;
 pub mod provision;
 pub mod serial;
-pub mod virtio;
+mod virtio_common;
 pub mod vm_manager;

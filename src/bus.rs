@@ -4,9 +4,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use vm_memory::GuestMemoryMmap;
+use virtio_bindings::virtio_mmio::VIRTIO_MMIO_CONFIG;
 
-use crate::{mmio::MMIOTransport, virtio::VirtioDevice};
+use crate::mmio::{MMIOTransport, MmioDevice};
+
+const VIRTIO_MMIO_CONFIG_SPACE_SIZE: u64 = 0xf00;
+pub const VIRTIO_MMIO_SIZE: u64 = VIRTIO_MMIO_CONFIG as u64 + VIRTIO_MMIO_CONFIG_SPACE_SIZE;
 
 pub struct Bus<A, D> {
     devices: Vec<BusDevice<A, D>>,
@@ -152,13 +155,11 @@ impl MMIOBus {
     pub fn insert_virtio(
         &mut self,
         address: u64,
-        device: Arc<Mutex<dyn VirtioDevice>>,
-        mem: GuestMemoryMmap,
+        device: Arc<Mutex<MmioDevice>>,
     ) -> Result<(), BusError> {
-        const MMIO_SIZE: u64 = 0x1000;
-        let device = MMIODevice::MMIOTransport(MMIOTransport::new(device, mem));
+        let device = MMIODevice::MMIOTransport(MMIOTransport::new(device));
         let end = address
-            .checked_add(MMIO_SIZE)
+            .checked_add(VIRTIO_MMIO_SIZE)
             .ok_or(BusError::AddressOverflow)?;
         self.insert(address..end, Arc::new(Mutex::new(device)))
     }
