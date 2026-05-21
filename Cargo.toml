@@ -19,6 +19,10 @@ slab = "0.4.12"
 tiny_http = "0.12.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+virtio-bindings = { git = "https://github.com/rust-vmm/vm-virtio.git", branch = "main" }
+virtio-blk = { git = "https://github.com/rust-vmm/vm-virtio.git", branch = "main", features = ["backend-stdio"] }
+virtio-device = { git = "https://github.com/rust-vmm/vm-virtio.git", branch = "main" }
+virtio-queue = { git = "https://github.com/rust-vmm/vm-virtio.git", branch = "main" }
 vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
 vm-superio = "0.8.1"
 vmm-sys-util = "0.15.0"

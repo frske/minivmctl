@@ -733,6 +733,10 @@ dependencies = [
  "tiny_http",
  "tracing",
  "tracing-subscriber",
+ "virtio-bindings",
+ "virtio-blk",
+ "virtio-device",
+ "virtio-queue",
  "vm-memory",
  "vm-superio",
  "vmm-sys-util",
@@ -1790,6 +1794,47 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "virtio-bindings"
+version = "0.2.7"
+source = "git+https://github.com/rust-vmm/vm-virtio.git?branch=main#eacc8b1d6a32bc8b7d88e3895326ba125621c2b5"
+
+[[package]]
+name = "virtio-blk"
+version = "0.1.0"
+source = "git+https://github.com/rust-vmm/vm-virtio.git?branch=main#eacc8b1d6a32bc8b7d88e3895326ba125621c2b5"
+dependencies = [
+ "log",
+ "virtio-bindings",
+ "virtio-device",
+ "virtio-queue",
+ "vm-memory",
+ "vmm-sys-util",
+]
+
+[[package]]
+name = "virtio-device"
+version = "0.1.0"
+source = "git+https://github.com/rust-vmm/vm-virtio.git?branch=main#eacc8b1d6a32bc8b7d88e3895326ba125621c2b5"
+dependencies = [
+ "log",
+ "virtio-bindings",
+ "virtio-queue",
+ "vm-memory",
+]
+
+[[package]]
+name = "virtio-queue"
+version = "0.17.0"
+source = "git+https://github.com/rust-vmm/vm-virtio.git?branch=main#eacc8b1d6a32bc8b7d88e3895326ba125621c2b5"
+dependencies = [
+ "libc",
+ "log",
+ "virtio-bindings",
+ "vm-memory",
+ "vmm-sys-util",
+]
 
 [[package]]
 name = "vm-memory"
