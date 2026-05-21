@@ -15,6 +15,7 @@ use std::{
 
 use kvm_ioctls::{IoEventAddress, VcpuExit, VmFd};
 use tracing::{debug, error, info, warn};
+use virtio_bindings::virtio_mmio::VIRTIO_MMIO_QUEUE_NOTIFY;
 use vm_memory::GuestMemoryMmap;
 use vm_superio::{Serial, Trigger};
 use vmm_sys_util::{
@@ -25,20 +26,19 @@ use vmm_sys_util::{
 use crate::{
     blk::Blk,
     boot::{self, BootArtifacts},
-    bus::MMIOBus,
+    bus::{MMIOBus, VIRTIO_MMIO_SIZE},
     event::EventWrapper,
     net::{self, Net},
     provision,
     serial::DummySerialEvent,
-    virtio::VirtioDevice,
 };
 
 type HostSerial = Serial<EventWrapper, DummySerialEvent, std::io::Sink>;
 pub type VmManagerResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const MMIO_MEM_START: u64 = 0xd0000000;
-const BLK_MMIO_MEM_START: u64 = MMIO_MEM_START + 0x1000;
-const QUEUE_NOTIFY_OFFSET: u64 = 0x50;
+const BLK_MMIO_MEM_START: u64 = MMIO_MEM_START + VIRTIO_MMIO_SIZE;
+const QUEUE_NOTIFY_OFFSET: u64 = VIRTIO_MMIO_QUEUE_NOTIFY as u64;
 const COM1: u16 = 0x3f8;
 const COMMAND_TOKEN: u8 = 0;
 const KERNEL_PATH: &str = "/home/frsk/prj/kernel_images/linux-6.6.99/vmlinux";
@@ -668,8 +668,12 @@ impl VmInstance {
         guest_mem: &GuestMemoryMmap<()>,
         mmio_bus: &mut MMIOBus,
     ) -> NetDeviceRuntime {
-        let virtio_net = net::Net::new(&config.tap_name(), Some(config.guest_mac()))
-            .expect("failed to create virtio net");
+        let virtio_net = net::Net::new(
+            &config.tap_name(),
+            Some(config.guest_mac()),
+            guest_mem.clone(),
+        )
+        .expect("failed to create virtio net");
         vm.register_irqfd(virtio_net.interrupt_event(), 5).unwrap();
         for (q_sel, evt) in virtio_net.queues_events().iter().enumerate() {
             let addr = IoEventAddress::Mmio(QUEUE_NOTIFY_OFFSET + MMIO_MEM_START);
@@ -684,7 +688,7 @@ impl VmInstance {
             .collect::<Vec<_>>();
         let device = Arc::new(Mutex::new(virtio_net));
         mmio_bus
-            .insert_virtio(MMIO_MEM_START, device.clone(), guest_mem.clone())
+            .insert_virtio(MMIO_MEM_START, device.clone())
             .expect("insert virtio net mmio");
 
         NetDeviceRuntime {
@@ -706,6 +710,7 @@ impl VmInstance {
                 .write(true)
                 .open(config.rootfs_path())
                 .expect("failed to open block path"),
+            guest_mem.clone(),
         )
         .expect("failed to create virtio blk");
         vm.register_irqfd(virtio_blk.interrupt_event(), 6).unwrap();
@@ -721,7 +726,7 @@ impl VmInstance {
             .collect::<Vec<_>>();
         let device = Arc::new(Mutex::new(virtio_blk));
         mmio_bus
-            .insert_virtio(BLK_MMIO_MEM_START, device.clone(), guest_mem.clone())
+            .insert_virtio(BLK_MMIO_MEM_START, device.clone())
             .expect("insert virtio blk mmio");
 
         BlkDeviceRuntime {
