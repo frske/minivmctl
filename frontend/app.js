@@ -13,6 +13,11 @@ const vmList = document.querySelector("#vm-list");
 sshKeyInput.value = localStorage.getItem(SSH_KEY_STORAGE_KEY) ?? "";
 
 async function api(path, options = {}) {
+  const { body } = await apiResponse(path, options);
+  return body;
+}
+
+async function apiResponse(path, options = {}) {
   const method = options.method ?? "GET";
   let response;
   try {
@@ -32,7 +37,7 @@ async function api(path, options = {}) {
     throw new Error(body?.error ?? `request failed with ${response.status}`);
   }
 
-  return body;
+  return { body, response };
 }
 
 async function readJson(response) {
@@ -77,7 +82,7 @@ function renderVms(vms) {
         </td>
         <td><span class="mono">${vm.memory_mib} MiB</span></td>
         <td><span class="status">${escapeHtml(vm.status)}</span></td>
-        <td><button class="danger" type="button" data-id="${vm.id}">Delete</button></td>
+        <td><button class="danger" type="button" data-stop-id="${vm.id}">Stop</button></td>
       `;
       return row;
     }),
@@ -111,7 +116,7 @@ form.addEventListener("submit", async (event) => {
 
   try {
     localStorage.setItem(SSH_KEY_STORAGE_KEY, sshKey);
-    const vm = await api("/vms", {
+    const { body: createdVm, response } = await apiResponse("/vms", {
       method: "POST",
       body: JSON.stringify({
         name,
@@ -119,6 +124,7 @@ form.addEventListener("submit", async (event) => {
         memory_mib: memoryMib,
       }),
     });
+    const vm = await api(response.headers.get("Location") ?? `/vms/${createdVm.id}`);
     nameInput.value = "";
     sshKeyInput.value = sshKey;
     setMessage(`VM ${vm.id} created.`, "ok");
@@ -167,17 +173,15 @@ vmList.addEventListener("click", async (event) => {
     return;
   }
 
-  const button = event.target.closest("button[data-id]");
+  const button = event.target.closest("button[data-stop-id]");
   if (!button) return;
 
   setBusy(true);
   try {
-    await api(`/vms/${button.dataset.id}`, { method: "DELETE" });
-    button.closest("tr")?.remove();
-    if (vmList.children.length === 0) {
-      vmList.innerHTML = '<tr><td colspan="6" class="empty">No VMs running</td></tr>';
-    }
-    setMessage(`VM ${button.dataset.id} stop requested.`, "ok");
+    const result = await api(`/vms/${button.dataset.stopId}`, { method: "DELETE" });
+    await sleep(500);
+    renderVms(await api("/vms"));
+    setMessage(result.message, "ok");
   } catch (error) {
     setMessage(error.message, "error");
   } finally {
