@@ -14,12 +14,22 @@ Content-Type: application/json
   "ssh_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA56S5GP6miraNlvrXNO6cfe9nhMaGpzXVspQmmC/R9K frsk@dhcp-10-126-119-0",
   "memory_mib": 512
 }
-HTTP 200
+HTTP 201
 [Captures]
 vm_1_id: jsonpath "$.id"
 [Asserts]
+header "Location" == "/vms/{{vm_1_id}}"
 jsonpath "$.name" == "web-1"
 jsonpath "$.id" exists
+jsonpath "$.ip_address" exists
+jsonpath "$.memory_mib" == 512
+jsonpath "$.status" == "running"
+
+GET {{base_url}}/vms/{{vm_1_id}}
+HTTP 200
+[Asserts]
+jsonpath "$.name" == "web-1"
+jsonpath "$.id" == {{vm_1_id}}
 jsonpath "$.ip_address" exists
 jsonpath "$.memory_mib" == 512
 jsonpath "$.status" == "running"
@@ -31,10 +41,11 @@ Content-Type: application/json
   "ssh_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA56S5GP6miraNlvrXNO6cfe9nhMaGpzXVspQmmC/R9K frsk@dhcp-10-126-119-0",
   "memory_mib": 1024
 }
-HTTP 200
+HTTP 201
 [Captures]
 vm_2_id: jsonpath "$.id"
 [Asserts]
+header "Location" == "/vms/{{vm_2_id}}"
 jsonpath "$.name" == "worker-1"
 jsonpath "$.id" exists
 jsonpath "$.ip_address" exists
@@ -48,10 +59,11 @@ Content-Type: application/json
   "ssh_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA56S5GP6miraNlvrXNO6cfe9nhMaGpzXVspQmmC/R9K frsk@dhcp-10-126-119-0",
   "memory_mib": 2048
 }
-HTTP 200
+HTTP 201
 [Captures]
 vm_3_id: jsonpath "$.id"
 [Asserts]
+header "Location" == "/vms/{{vm_3_id}}"
 jsonpath "$.name" == "worker-2"
 jsonpath "$.id" exists
 jsonpath "$.ip_address" exists
@@ -64,16 +76,16 @@ HTTP 200
 jsonpath "$" isCollection
 
 DELETE {{base_url}}/vms/{{vm_1_id}}
-HTTP 200
+HTTP 202
 [Asserts]
 jsonpath "$.message" contains "stop requested"
 
 DELETE {{base_url}}/vms/{{vm_2_id}}
-HTTP 200
+HTTP 202
 [Asserts]
 jsonpath "$.message" contains "stop requested"
 
 DELETE {{base_url}}/vms/{{vm_3_id}}
-HTTP 200
+HTTP 202
 [Asserts]
 jsonpath "$.message" contains "stop requested"

@@ -59,10 +59,10 @@ struct ApiError {
 type ApiResult<T> = Result<Json<T>, status::Custom<Json<ApiError>>>;
 
 pub fn rocket(handle: VmManagerHandle) -> Rocket<Build> {
-    rocket::build()
-        .manage(handle)
-        .attach(Cors)
-        .mount("/", routes![list_vms, create_vm, delete_vm, options])
+    rocket::build().manage(handle).attach(Cors).mount(
+        "/",
+        routes![list_vms, get_vm, create_vm, delete_vm, options],
+    )
 }
 
 #[get("/vms")]
@@ -73,11 +73,25 @@ fn list_vms(handle: &State<VmManagerHandle>) -> ApiResult<Vec<VmResponse>> {
     Ok(Json(responses))
 }
 
+#[get("/vms/<id>")]
+fn get_vm(handle: &State<VmManagerHandle>, id: u8) -> ApiResult<VmResponse> {
+    debug!(id, "get vm requested");
+    let vm = handle
+        .list_vms()
+        .map_err(api_error)?
+        .into_iter()
+        .find(|vm| vm.id == id)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("vm {id} is not running")))
+        .map_err(|err| api_error(err.into()))?;
+
+    Ok(Json(VmResponse::from(vm)))
+}
+
 #[post("/vms", data = "<request>")]
 fn create_vm(
     handle: &State<VmManagerHandle>,
     request: Json<CreateVmRequest>,
-) -> ApiResult<VmResponse> {
+) -> Result<status::Created<Json<VmResponse>>, status::Custom<Json<ApiError>>> {
     validate_memory_mib(request.memory_mib).map_err(api_error)?;
 
     info!(name = %request.name, memory_mib = request.memory_mib, "create vm requested");
@@ -89,17 +103,24 @@ fn create_vm(
         )
         .map_err(api_error)?;
 
-    Ok(Json(VmResponse::from(vm)))
+    let location = format!("/vms/{}", vm.id);
+    Ok(status::Created::new(location).body(Json(VmResponse::from(vm))))
 }
 
 #[delete("/vms/<id>")]
-fn delete_vm(handle: &State<VmManagerHandle>, id: u8) -> ApiResult<ApiMessage> {
-    info!(id, "delete vm requested");
+fn delete_vm(
+    handle: &State<VmManagerHandle>,
+    id: u8,
+) -> Result<status::Custom<Json<ApiMessage>>, status::Custom<Json<ApiError>>> {
+    info!(id, "vm stop requested");
     handle.request_stop_vm(id).map_err(api_error)?;
 
-    Ok(Json(ApiMessage {
-        message: format!("vm {id} stop requested"),
-    }))
+    Ok(status::Custom(
+        Status::Accepted,
+        Json(ApiMessage {
+            message: format!("vm {id} stop requested"),
+        }),
+    ))
 }
 
 #[options("/<_path..>")]
