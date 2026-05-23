@@ -24,7 +24,6 @@ use virtio_device::{VirtioConfig, VirtioDeviceActions, VirtioDeviceType, VirtioM
 use virtio_queue::{DescriptorChain, Queue, QueueOwnedT, QueueT};
 use vm_memory::{Address, Bytes, GuestMemoryBackend, GuestMemoryMmap};
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
-use vmm_sys_util::poll::PollContext;
 
 use crate::virtio_common::{IrqTrigger, feature_bit, reset_config};
 
@@ -344,9 +343,8 @@ impl Net<Tap> {
         Net::with_tap(tap, mac, mem)
     }
 
-    pub fn register_tap_readable(&self, poll: &PollContext<u8>, token: u8) -> io::Result<()> {
-        poll.add(&self.tap, token)
-            .map_err(|e| io::Error::from_raw_os_error(e.errno()))
+    pub fn tap_raw_fd(&self) -> std::os::fd::RawFd {
+        self.tap.as_raw_fd()
     }
 }
 

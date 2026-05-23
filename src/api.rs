@@ -61,8 +61,22 @@ type ApiResult<T> = Result<Json<T>, status::Custom<Json<ApiError>>>;
 pub fn rocket(handle: VmManagerHandle) -> Rocket<Build> {
     rocket::build().manage(handle).attach(Cors).mount(
         "/",
-        routes![list_vms, get_vm, create_vm, delete_vm, options],
+        routes![
+            root, favicon, list_vms, get_vm, create_vm, delete_vm, options
+        ],
     )
+}
+
+#[get("/")]
+fn root() -> Json<ApiMessage> {
+    Json(ApiMessage {
+        message: "minivmctl api".to_string(),
+    })
+}
+
+#[get("/favicon.ico")]
+fn favicon() -> Status {
+    Status::NoContent
 }
 
 #[get("/vms")]
