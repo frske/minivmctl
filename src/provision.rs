@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info};
 
-const ROOTFS_PATH: &str = "/home/frsk/prj/kernel_images/rootfs.ext4";
 // const ROOTFS_PATH: &str = "/home/frsk/prj/kernel_images/rootfs.ext4";
+const ROOTFS_PATH: &str = "/tmp/script/rootfs/rootfs_deb.ext4";
 
 pub type ProvisionError = Box<dyn std::error::Error + Send + Sync>;
 pub type ProvisionResult<T> = Result<T, ProvisionError>;
@@ -165,21 +165,22 @@ fn configure_tap_interface(id: u8) -> ProvisionResult<()> {
         .stderr(std::process::Stdio::null())
         .status();
 
-    if matches!(exists, Ok(s) if s.success()) {
-        return Ok(());
+    if !matches!(exists, Ok(s) if s.success()) {
+        run_ip(&["tuntap", "add", "dev", &tap_name, "mode", "tap"])?;
     }
 
-    Command::new("ip")
-        .args(["tuntap", "add", "dev", &tap_name, "mode", "tap"])
-        .status()?;
+    run_ip(&["link", "set", "dev", &tap_name, "up"])?;
+    run_ip(&["link", "set", &tap_name, "master", "br0"])?;
 
-    Command::new("ip")
-        .args(["link", "set", "dev", &tap_name, "up"])
-        .status()?;
+    Ok(())
+}
 
-    Command::new("ip")
-        .args(["link", "set", &tap_name, "master", "br0"])
-        .status()?;
+fn run_ip(args: &[&str]) -> ProvisionResult<()> {
+    let status = Command::new("ip").args(args).status()?;
+
+    if !status.success() {
+        return Err(format!("ip command failed: ip {}", args.join(" ")).into());
+    }
 
     Ok(())
 }
