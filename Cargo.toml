@@ -12,7 +12,7 @@ libc = "0.2.186"
 linux-loader = {git = "https://github.com/frske/linux-loader.git", branch = "topic/vm-memory-0.18"  }
 netdev = "0.34.0"
 iptables = "0.5.0"
-nix = { version = "0.29.0", features = ["mount", "user"] }
+nix = { version = "0.29.0", features = ["fs", "ioctl", "mount", "signal", "user"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 rocket = { version = "0.5.1", features = ["json", "tls"] }

@@ -18,6 +18,7 @@ use event_manager::{
     EventManager, EventOps, Events, MutEventSubscriber, RemoteEndpoint, SubscriberId, SubscriberOps,
 };
 use kvm_ioctls::{IoEventAddress, VcpuExit, VmFd};
+use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, Signal};
 use tracing::{debug, error, info, warn};
 use virtio_bindings::virtio_mmio::VIRTIO_MMIO_QUEUE_NOTIFY;
 use vm_memory::GuestMemoryMmap;
@@ -43,7 +44,7 @@ const BLK_MMIO_MEM_START: u64 = MMIO_MEM_START + VIRTIO_MMIO_SIZE;
 const QUEUE_NOTIFY_OFFSET: u64 = VIRTIO_MMIO_QUEUE_NOTIFY as u64;
 const COM1: u16 = 0x3f8;
 const KERNEL_PATH: &str = "/home/frsk/prj/kernel_images/linux-6.6.99/vmlinux";
-const VM_STOP_SIGNAL: libc::c_int = libc::SIGUSR1;
+const VM_STOP_SIGNAL: Signal = Signal::SIGUSR1;
 static STOP_SIGNAL_HANDLER_RESULT: OnceLock<Result<(), i32>> = OnceLock::new();
 
 pub struct VmManagerHandle {
@@ -1019,6 +1020,8 @@ impl VcpuStopper {
     }
 
     fn set_thread(&self) {
+        // SAFETY: called from the vCPU thread itself; the pthread id is stored only for best-effort
+        // interrupt delivery and cleared before thread exit.
         *self.thread.lock().unwrap() = Some(unsafe { libc::pthread_self() });
     }
 
@@ -1040,6 +1043,8 @@ impl VcpuStopper {
 
         let kvm_run = self.kvm_run.load(Ordering::SeqCst);
         if !kvm_run.is_null() {
+            // SAFETY: pointer comes from live `VcpuFd::get_kvm_run()` in the vCPU thread and is
+            // cleared before that thread exits. Volatile write is required by KVM immediate_exit.
             unsafe {
                 ptr::write_volatile(ptr::addr_of_mut!((*kvm_run).immediate_exit), 1);
             }
@@ -1050,7 +1055,9 @@ impl VcpuStopper {
             return Ok(());
         };
 
-        let ret = unsafe { libc::pthread_kill(thread, VM_STOP_SIGNAL) };
+        // SAFETY: `thread` came from `pthread_self` in the vCPU thread and is cleared when that
+        // thread exits. ESRCH is accepted because the thread may exit concurrently.
+        let ret = unsafe { libc::pthread_kill(thread, VM_STOP_SIGNAL as libc::c_int) };
         if ret != 0 && ret != libc::ESRCH {
             return Err(io::Error::from_raw_os_error(ret));
         }
@@ -1065,19 +1072,18 @@ impl VcpuStopper {
 extern "C" fn handle_stop_signal(_signal: libc::c_int) {}
 
 fn install_stop_signal_handler() -> io::Result<()> {
+    // SAFETY: handler is async-signal-safe because it performs no work; signal is used only to
+    // interrupt KVM_RUN after `immediate_exit` is set.
     match *STOP_SIGNAL_HANDLER_RESULT.get_or_init(|| unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = handle_stop_signal as *const () as usize;
-        libc::sigemptyset(&mut action.sa_mask);
-        action.sa_flags = 0;
-        let ret = libc::sigaction(VM_STOP_SIGNAL, &action, std::ptr::null_mut());
-        if ret == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EINVAL))
-        }
+        let action = SigAction::new(
+            SigHandler::Handler(handle_stop_signal),
+            SaFlags::empty(),
+            SigSet::empty(),
+        );
+
+        signal::sigaction(VM_STOP_SIGNAL, &action)
+            .map(drop)
+            .map_err(|err| err as i32)
     }) {
         Ok(()) => Ok(()),
         Err(errno) => Err(io::Error::from_raw_os_error(errno)),
@@ -1085,11 +1091,10 @@ fn install_stop_signal_handler() -> io::Result<()> {
 }
 
 fn unblock_stop_signal() {
-    unsafe {
-        let mut signals: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut signals);
-        libc::sigaddset(&mut signals, VM_STOP_SIGNAL);
-        libc::pthread_sigmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut());
+    let mut signals = SigSet::empty();
+    signals.add(VM_STOP_SIGNAL);
+    if let Err(err) = signal::pthread_sigmask(SigmaskHow::SIG_UNBLOCK, Some(&signals), None) {
+        warn!(error = %err, "failed to unblock vm stop signal");
     }
 }
 

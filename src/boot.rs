@@ -105,10 +105,12 @@ pub fn register_guest_memory(vm: &VmFd, guest_mem: &GuestMemoryMmap<()>, memory_
         flags: KVM_MEM_LOG_DIRTY_PAGES,
     };
 
+    // SAFETY: `userspace_addr` points into `guest_mem`, and callers keep that mapping alive while
+    // the VM can access this memory slot.
     unsafe {
         vm.set_user_memory_region(mem_region)
-            .expect("set user memory region failed");
-    }
+            .expect("set user memory region failed")
+    };
 }
 
 pub fn write_page_tables(

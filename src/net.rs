@@ -1,14 +1,14 @@
 use std::{
     borrow::{Borrow, BorrowMut},
-    fs::File,
+    fs::{File, OpenOptions},
     io,
-    mem::transmute,
     ops::Deref,
-    os::fd::{AsRawFd, FromRawFd},
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     sync::Arc,
 };
 
 use libc::{IFNAMSIZ, TUN_F_CSUM, ifreq};
+use nix::{ioctl_write_int_bad, ioctl_write_ptr_bad};
 use virtio_bindings::bindings::{
     virtio_config::VIRTIO_F_VERSION_1,
     virtio_net::{
@@ -39,6 +39,10 @@ const RX_INDEX: usize = 0;
 const TX_INDEX: usize = 1;
 const VNET_HDR_NUM_BUFFERS_OFFSET: usize = 10;
 
+ioctl_write_ptr_bad!(tun_set_iff, 0x4004_54ca, ifreq);
+ioctl_write_ptr_bad!(tun_set_vnet_hdr_size, 0x4004_54d8, libc::c_int);
+ioctl_write_int_bad!(tun_set_offload, 0x4004_54d0);
+
 pub struct Tap {
     file: File,
 }
@@ -66,22 +70,14 @@ impl AsRawFd for Tap {
 
 impl Tap {
     pub fn new(name: &str) -> io::Result<Self> {
-        const DEVICE: &str = "/dev/net/tun\0";
+        const DEVICE: &str = "/dev/net/tun";
         const FLAGS: i16 = (libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_VNET_HDR) as i16;
-        const TUNSEITFF: libc::c_ulong = 0x4004_54ca;
 
-        let fd = unsafe {
-            libc::open(
-                DEVICE.as_ptr() as *const _,
-                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
-        };
-
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        let file = unsafe { File::from_raw_fd(fd) };
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(DEVICE)?;
         let mut cname = [0; IFNAMSIZ];
 
         if name.len() >= IFNAMSIZ {
@@ -92,25 +88,28 @@ impl Tap {
         }
 
         cname[..name.len()].copy_from_slice(name.as_bytes());
+        let mut ifr_name = [0 as libc::c_char; IFNAMSIZ];
+        for (dst, src) in ifr_name.iter_mut().zip(cname) {
+            *dst = src as libc::c_char;
+        }
         let mut ifr = ifreq {
-            ifr_name: unsafe { transmute::<[u8; IFNAMSIZ], [libc::c_char; IFNAMSIZ]>(cname) },
+            ifr_name,
+            // SAFETY: `ifreq` is a C ioctl struct. Zeroing the union before setting `ifru_flags`
+            // matches the kernel API expectation for TUNSETIFF.
             ifr_ifru: unsafe { std::mem::zeroed() },
         };
         ifr.ifr_ifru.ifru_flags = FLAGS;
 
-        if unsafe { libc::ioctl(fd, TUNSEITFF, &ifr) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        // SAFETY: `file` is an open `/dev/net/tun` fd and `ifr` points to a valid initialized
+        // `ifreq` for the duration of the ioctl call.
+        unsafe { tun_set_iff(file.as_raw_fd(), &ifr) }.map_err(nix_to_io)?;
 
         Ok(Self { file })
     }
 
     pub fn set_vnet_hdr_size(&self, size: libc::c_int) -> io::Result<()> {
-        const TUNSETVNETHDRSZ: libc::c_ulong = 0x4004_54d8;
-
-        if unsafe { libc::ioctl(self.file.as_raw_fd(), TUNSETVNETHDRSZ, &size) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        // SAFETY: ioctl only reads `size`, which lives until the call returns.
+        unsafe { tun_set_vnet_hdr_size(self.file.as_raw_fd(), &size) }.map_err(nix_to_io)?;
 
         Ok(())
     }
@@ -122,7 +121,11 @@ impl Tap {
     {
         let mut iovecs = Vec::new();
         let iov = chain_iovec(data, &mut iovecs, true)?;
-        let ret = unsafe { libc::readv(self.file.as_raw_fd(), iov.as_ptr(), iov.len() as i32) };
+        let iov_len = i32::try_from(iov.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many iovecs"))?;
+        // SAFETY: `iov` points to guest-memory slices that remain borrowed until `readv` returns;
+        // `iov_len` is checked to fit the syscall ABI.
+        let ret = unsafe { libc::readv(self.file.as_raw_fd(), iov.as_ptr(), iov_len) };
         if ret == -1 {
             return Err(io::Error::last_os_error());
         }
@@ -137,7 +140,11 @@ impl Tap {
     {
         let mut iovecs = Vec::new();
         let iov = chain_iovec(data, &mut iovecs, false)?;
-        let ret = unsafe { libc::writev(self.file.as_raw_fd(), iov.as_ptr(), iov.len() as i32) };
+        let iov_len = i32::try_from(iov.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many iovecs"))?;
+        // SAFETY: `iov` points to guest-memory slices that remain borrowed until `writev` returns;
+        // `iov_len` is checked to fit the syscall ABI.
+        let ret = unsafe { libc::writev(self.file.as_raw_fd(), iov.as_ptr(), iov_len) };
         if ret == -1 {
             return Err(io::Error::last_os_error());
         }
@@ -211,6 +218,8 @@ pub struct Net<I = Tap> {
     pub activate_event: EventFd,
 }
 
+// SAFETY: `Net` only shares ownership of sendable fields across threads. Guest memory is internally
+// synchronized by `vm-memory`, eventfds are fd-backed, and the TAP implementation is bounded by `I: Send`.
 unsafe impl<I: Send> Send for Net<I> {}
 
 impl<I> Net<I>
@@ -486,10 +495,12 @@ impl Tap {
     }
 
     pub fn set_offload(&self, offload: libc::c_uint) -> io::Result<()> {
-        const TUNSETOFFLOAD: libc::c_ulong = 0x4004_54d0;
-        if unsafe { libc::ioctl(self.file.as_raw_fd(), TUNSETOFFLOAD, offload) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        // SAFETY: ioctl receives an integer bitmask; no pointer aliasing/lifetime concerns.
+        unsafe { tun_set_offload(self.file.as_raw_fd(), offload as _) }.map_err(nix_to_io)?;
         Ok(())
     }
+}
+
+fn nix_to_io(err: nix::errno::Errno) -> io::Error {
+    io::Error::from_raw_os_error(err as i32)
 }
