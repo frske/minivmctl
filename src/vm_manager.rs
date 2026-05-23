@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fs::OpenOptions,
     io,
+    os::fd::AsRawFd,
     path::PathBuf,
     ptr,
     sync::{
@@ -13,15 +14,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+use event_manager::{
+    EventManager, EventOps, Events, MutEventSubscriber, RemoteEndpoint, SubscriberId, SubscriberOps,
+};
 use kvm_ioctls::{IoEventAddress, VcpuExit, VmFd};
 use tracing::{debug, error, info, warn};
 use virtio_bindings::virtio_mmio::VIRTIO_MMIO_QUEUE_NOTIFY;
 use vm_memory::GuestMemoryMmap;
 use vm_superio::{Serial, Trigger};
-use vmm_sys_util::{
-    eventfd::EventFd,
-    poll::{PollContext, PollEvents},
-};
+use vmm_sys_util::epoll::EventSet;
+use vmm_sys_util::eventfd::EventFd;
 
 use crate::{
     blk::Blk,
@@ -40,41 +42,21 @@ const MMIO_MEM_START: u64 = 0xd0000000;
 const BLK_MMIO_MEM_START: u64 = MMIO_MEM_START + VIRTIO_MMIO_SIZE;
 const QUEUE_NOTIFY_OFFSET: u64 = VIRTIO_MMIO_QUEUE_NOTIFY as u64;
 const COM1: u16 = 0x3f8;
-const COMMAND_TOKEN: u8 = 0;
 const KERNEL_PATH: &str = "/home/frsk/prj/kernel_images/linux-6.6.99/vmlinux";
 const VM_STOP_SIGNAL: libc::c_int = libc::SIGUSR1;
 static STOP_SIGNAL_HANDLER_RESULT: OnceLock<Result<(), i32>> = OnceLock::new();
 
-enum VmCommand {
-    Start {
-        name: String,
-        ssh_key: String,
-        memory_mib: u32,
-        response: mpsc::Sender<VmManagerResult<VmInfo>>,
-    },
-    List {
-        response: mpsc::Sender<VmManagerResult<Vec<VmInfo>>>,
-    },
-    Stop {
-        id: u8,
-        response: mpsc::Sender<VmManagerResult<()>>,
-    },
-    Shutdown {
-        response: mpsc::Sender<VmManagerResult<()>>,
-    },
-}
-
 pub struct VmManagerHandle {
-    command_tx: mpsc::Sender<VmCommand>,
-    command_evt: Arc<EventWrapper>,
+    endpoint: RemoteEndpoint<VmInstance>,
+    registry: Arc<Mutex<VmRegistry>>,
     manager_running: Arc<AtomicBool>,
 }
 
 impl Clone for VmManagerHandle {
     fn clone(&self) -> Self {
         Self {
-            command_tx: self.command_tx.clone(),
-            command_evt: Arc::clone(&self.command_evt),
+            endpoint: self.endpoint.clone(),
+            registry: Arc::clone(&self.registry),
             manager_running: Arc::clone(&self.manager_running),
         }
     }
@@ -87,42 +69,81 @@ impl VmManagerHandle {
         ssh_key: String,
         memory_mib: u32,
     ) -> VmManagerResult<VmInfo> {
-        self.send_command(
-            "vm manager is not running",
-            Duration::from_secs(120),
-            |response| VmCommand::Start {
-                name,
-                ssh_key,
-                memory_mib,
-                response,
-            },
-        )
+        let registry = Arc::clone(&self.registry);
+        let endpoint = self.endpoint.clone();
+        self.call(Duration::from_secs(120), move |ops| {
+            let config = allocate_vm_config(&registry, name, ssh_key, memory_mib)?;
+            let vm_id = config.id();
+            let had_instances = has_running_vms(&registry);
+
+            if !is_shared_host_provisioned(&registry) {
+                debug!("provisioning shared host");
+                provision::provision_shared_host()?;
+                set_shared_host_provisioned(&registry, true);
+                debug!("shared host provisioned");
+            }
+
+            let subscriber_id = Arc::new(Mutex::new(None));
+            let init_error = Arc::new(Mutex::new(None));
+            let instance = match VmInstance::start(
+                config,
+                Arc::clone(&registry),
+                endpoint,
+                Arc::clone(&subscriber_id),
+                Arc::clone(&init_error),
+            ) {
+                Ok(instance) => instance,
+                Err(err) => {
+                    error!(vm_id, error = %err, "failed to start vm");
+                    cleanup_vm_resources(vm_id);
+                    if !had_instances {
+                        cleanup_shared_host(&registry);
+                    }
+                    return Err(err);
+                }
+            };
+
+            let info = instance.info();
+            let stopper = instance.vcpu_stopper.clone();
+            let id = ops.add_subscriber(instance);
+            *subscriber_id.lock().unwrap() = Some(id);
+            if let Some(err) = init_error.lock().unwrap().take() {
+                let _ = ops.remove_subscriber(id);
+                if !had_instances {
+                    cleanup_shared_host(&registry);
+                }
+                return Err(err);
+            }
+            insert_vm_entry(&registry, id, info.clone(), stopper);
+            info!(vm_id, "vm started");
+            Ok(info)
+        })
     }
 
     pub fn list_vms(&self) -> VmManagerResult<Vec<VmInfo>> {
-        self.send_command(
-            "vm manager is not running",
-            Duration::from_secs(5),
-            |response| VmCommand::List { response },
-        )
+        self.ensure_running()?;
+        Ok(list_registry_vms(&self.registry))
     }
 
     /// Requests a hard stop and returns when the manager accepts the request.
     /// VM cleanup completes later through the existing vCPU exit event path.
     pub fn request_stop_vm(&self, id: u8) -> VmManagerResult<()> {
-        self.send_command(
-            "vm manager is not running",
-            Duration::from_secs(5),
-            |response| VmCommand::Stop { id, response },
-        )
+        self.ensure_running()?;
+        let registry = Arc::clone(&self.registry);
+        self.call(Duration::from_secs(5), move |_ops| {
+            let stopper = vm_stopper(&registry, id)?;
+            stopper.request_stop()?;
+            Ok(())
+        })
     }
 
     pub fn shutdown(&self) -> VmManagerResult<()> {
-        self.send_command(
-            "vm manager is not running",
-            Duration::from_secs(5),
-            |response| VmCommand::Shutdown { response },
-        )
+        self.ensure_running()?;
+        let registry = Arc::clone(&self.registry);
+        self.call(Duration::from_secs(5), move |_ops| {
+            mark_registry_shutting_down(&registry);
+            request_stop_all_registry_vms(&registry)
+        })
     }
 
     pub fn wait_until_running(&self, timeout: Duration) -> VmManagerResult<()> {
@@ -137,21 +158,33 @@ impl VmManagerHandle {
         Err(io::Error::new(io::ErrorKind::TimedOut, "vm manager did not start").into())
     }
 
-    fn send_command<T>(
-        &self,
-        not_running_message: &'static str,
-        timeout: Duration,
-        command: impl FnOnce(mpsc::Sender<VmManagerResult<T>>) -> VmCommand,
-    ) -> VmManagerResult<T> {
+    fn ensure_running(&self) -> VmManagerResult<()> {
         if !self.manager_running.load(Ordering::SeqCst) {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, not_running_message).into());
+            return Err(
+                io::Error::new(io::ErrorKind::NotConnected, "vm manager is not running").into(),
+            );
         }
 
+        Ok(())
+    }
+
+    fn call<T>(
+        &self,
+        timeout: Duration,
+        f: impl FnOnce(&mut dyn SubscriberOps<Subscriber = VmInstance>) -> VmManagerResult<T>
+        + Send
+        + 'static,
+    ) -> VmManagerResult<T>
+    where
+        T: Send + 'static,
+    {
+        self.ensure_running()?;
+
         let (response_tx, response_rx) = mpsc::channel();
-        self.command_tx
-            .send(command(response_tx))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "vm manager is not running"))?;
-        self.command_evt.as_ref().trigger()?;
+        self.endpoint.fire(move |ops| {
+            let _ = response_tx.send(f(ops));
+        })?;
+
         response_rx.recv_timeout(timeout).map_err(|err| {
             let kind = match err {
                 mpsc::RecvTimeoutError::Timeout => io::ErrorKind::TimedOut,
@@ -171,20 +204,24 @@ pub struct VmInfo {
     pub status: &'static str,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EventKind {
-    Exit,
-    NetActivate,
-    NetQueue(usize),
-    BlkQueue(usize),
-    TapRx,
+#[derive(Default)]
+struct VmRegistry {
+    next_vm_id: u8,
+    entries: HashMap<u8, VmEntry>,
+    shared_host_provisioned: bool,
+    shutting_down: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct EventRoute {
-    vm_id: u8,
-    kind: EventKind,
+struct VmEntry {
+    info: VmInfo,
+    stopper: VcpuStopper,
 }
+
+const EXIT_EVENT: u32 = 0;
+const NET_ACTIVATE_EVENT: u32 = 1;
+const TAP_RX_EVENT: u32 = 2;
+const NET_QUEUE_EVENT_BASE: u32 = 100;
+const BLK_QUEUE_EVENT_BASE: u32 = 200;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmConfig {
@@ -232,53 +269,166 @@ impl VmConfig {
     }
 }
 
+fn allocate_vm_config(
+    registry: &Arc<Mutex<VmRegistry>>,
+    name: String,
+    ssh_key: String,
+    memory_mib: u32,
+) -> VmManagerResult<VmConfig> {
+    let mut registry = registry.lock().unwrap();
+    if registry.shutting_down {
+        return Err(
+            io::Error::new(io::ErrorKind::NotConnected, "vm manager is shutting down").into(),
+        );
+    }
+    if registry.next_vm_id > 253 {
+        return Err(io::Error::other("exhausted vm ids").into());
+    }
+
+    let id = registry.next_vm_id;
+    registry.next_vm_id = registry
+        .next_vm_id
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("exhausted vm ids"))?;
+
+    Ok(VmConfig {
+        id,
+        name,
+        ssh_key,
+        memory_mib,
+    })
+}
+
+fn insert_vm_entry(
+    registry: &Arc<Mutex<VmRegistry>>,
+    _subscriber_id: SubscriberId,
+    info: VmInfo,
+    stopper: VcpuStopper,
+) {
+    registry
+        .lock()
+        .unwrap()
+        .entries
+        .insert(info.id, VmEntry { info, stopper });
+}
+
+fn remove_vm_entry(registry: &Arc<Mutex<VmRegistry>>, id: u8) -> bool {
+    let mut registry = registry.lock().unwrap();
+    registry.entries.remove(&id).is_some()
+}
+
+fn list_registry_vms(registry: &Arc<Mutex<VmRegistry>>) -> Vec<VmInfo> {
+    let mut vms = registry
+        .lock()
+        .unwrap()
+        .entries
+        .values()
+        .map(|entry| entry.info.clone())
+        .collect::<Vec<_>>();
+    vms.sort_by_key(|vm| vm.id);
+    vms
+}
+
+fn vm_stopper(registry: &Arc<Mutex<VmRegistry>>, id: u8) -> VmManagerResult<VcpuStopper> {
+    registry
+        .lock()
+        .unwrap()
+        .entries
+        .get(&id)
+        .map(|entry| entry.stopper.clone())
+        .ok_or_else(|| {
+            warn!(id, "stop requested for missing vm");
+            io::Error::new(io::ErrorKind::NotFound, format!("vm {id} is not running")).into()
+        })
+}
+
+fn has_running_vms(registry: &Arc<Mutex<VmRegistry>>) -> bool {
+    !registry.lock().unwrap().entries.is_empty()
+}
+
+fn is_shared_host_provisioned(registry: &Arc<Mutex<VmRegistry>>) -> bool {
+    registry.lock().unwrap().shared_host_provisioned
+}
+
+fn set_shared_host_provisioned(registry: &Arc<Mutex<VmRegistry>>, provisioned: bool) {
+    registry.lock().unwrap().shared_host_provisioned = provisioned;
+}
+
+fn cleanup_shared_host(registry: &Arc<Mutex<VmRegistry>>) {
+    let should_cleanup = {
+        let mut registry = registry.lock().unwrap();
+        if !registry.shared_host_provisioned {
+            false
+        } else {
+            registry.shared_host_provisioned = false;
+            true
+        }
+    };
+
+    if should_cleanup {
+        debug!("cleaning up shared host");
+        if let Err(err) = provision::deprovision_shared_host() {
+            warn!(error = %err, "failed to deprovision shared host");
+        }
+    }
+}
+
+fn mark_registry_shutting_down(registry: &Arc<Mutex<VmRegistry>>) {
+    registry.lock().unwrap().shutting_down = true;
+}
+
+fn registry_should_exit(registry: &Arc<Mutex<VmRegistry>>) -> bool {
+    let registry = registry.lock().unwrap();
+    registry.shutting_down && registry.entries.is_empty()
+}
+
+fn request_stop_all_registry_vms(registry: &Arc<Mutex<VmRegistry>>) -> VmManagerResult<()> {
+    let entries = registry
+        .lock()
+        .unwrap()
+        .entries
+        .iter()
+        .map(|(&id, entry)| (id, entry.stopper.clone()))
+        .collect::<Vec<_>>();
+    let mut first_error = None;
+
+    for (id, stopper) in entries {
+        if let Err(err) = stopper.request_stop() {
+            warn!(vm_id = id, error = %err, "failed to request vm stop");
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+        }
+    }
+
+    first_error.map_or(Ok(()), |err| Err(err.into()))
+}
+
 pub struct VmManager {
-    configs: HashMap<u8, VmConfig>,
-    instances: HashMap<u8, VmInstance>,
-    shared_host_provisioned: bool,
-    command_tx: mpsc::Sender<VmCommand>,
-    command_rx: mpsc::Receiver<VmCommand>,
-    command_evt: Arc<EventWrapper>,
+    event_manager: Option<EventManager<VmInstance>>,
+    registry: Arc<Mutex<VmRegistry>>,
+    endpoint: RemoteEndpoint<VmInstance>,
     manager_running: Arc<AtomicBool>,
-    next_vm_id: u8,
-    shutting_down: bool,
 }
 
 impl VmManager {
     pub fn new() -> Self {
-        let (command_tx, command_rx) = mpsc::channel();
+        let event_manager = EventManager::new().expect("failed to create vm event manager");
+        let endpoint = event_manager.remote_endpoint();
         Self {
-            configs: HashMap::new(),
-            instances: HashMap::new(),
-            shared_host_provisioned: false,
-            command_tx,
-            command_rx,
-            command_evt: Arc::new(EventWrapper::new()),
+            event_manager: Some(event_manager),
+            registry: Arc::new(Mutex::new(VmRegistry::default())),
+            endpoint,
             manager_running: Arc::new(AtomicBool::new(false)),
-            next_vm_id: 0,
-            shutting_down: false,
         }
     }
 
     pub fn handle(&self) -> VmManagerResult<VmManagerHandle> {
         Ok(VmManagerHandle {
-            command_tx: self.command_tx.clone(),
-            command_evt: Arc::clone(&self.command_evt),
+            endpoint: self.endpoint.clone(),
+            registry: Arc::clone(&self.registry),
             manager_running: Arc::clone(&self.manager_running),
         })
-    }
-
-    pub fn add_vm(&mut self, config: VmConfig) -> VmManagerResult<()> {
-        if self.configs.contains_key(&config.id()) || self.instances.contains_key(&config.id()) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("duplicate vm id {}", config.id()),
-            )
-            .into());
-        }
-
-        self.configs.insert(config.id(), config);
-        Ok(())
     }
 
     pub fn run(&mut self) -> VmManagerResult<()> {
@@ -289,6 +439,7 @@ impl VmManager {
             error!(error = %err, "vm manager run loop failed");
         }
         self.cleanup_instances();
+        self.event_manager.take();
         self.cleanup_shared_host();
         self.manager_running.store(false, Ordering::SeqCst);
         info!("vm manager stopped");
@@ -296,262 +447,24 @@ impl VmManager {
     }
 
     fn run_inner(&mut self) -> VmManagerResult<()> {
-        let poll: PollContext<u8> = PollContext::new().unwrap();
-        let mut routes = HashMap::new();
-        let mut next_token_count = 1usize;
+        let event_manager = self
+            .event_manager
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "vm manager already ran"))?;
 
-        poll.add(&self.command_evt.0, COMMAND_TOKEN)
-            .map_err(|e| io::Error::from_raw_os_error(e.errno()))?;
-
-        self.start_configured_vms(&poll, &mut routes, &mut next_token_count)?;
-
-        loop {
-            let events: PollEvents<u8> = poll.wait().unwrap();
-            for event in events.iter_readable() {
-                if event.token() == COMMAND_TOKEN {
-                    self.handle_commands(&poll, &mut routes, &mut next_token_count)?;
-                    if self.should_exit() {
-                        return Ok(());
-                    }
-                    continue;
-                }
-
-                let Some(route) = routes.get(&event.token()).copied() else {
-                    continue;
-                };
-
-                let should_remove = match self.instances.get_mut(&route.vm_id) {
-                    Some(instance) => instance.handle_event(
-                        route.kind,
-                        route.vm_id,
-                        &poll,
-                        &mut routes,
-                        &mut next_token_count,
-                    )?,
-                    None => false,
-                };
-
-                if should_remove {
-                    self.cleanup_instance(route.vm_id, &mut routes);
-                    if self.instances.is_empty() {
-                        self.cleanup_shared_host();
-                        if self.should_exit() {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn handle_commands(
-        &mut self,
-        poll: &PollContext<u8>,
-        routes: &mut HashMap<u8, EventRoute>,
-        next_token_count: &mut usize,
-    ) -> VmManagerResult<()> {
-        let _ = self.command_evt.read();
-
-        while let Ok(command) = self.command_rx.try_recv() {
-            match command {
-                VmCommand::Start {
-                    name,
-                    ssh_key,
-                    memory_mib,
-                    response,
-                } => {
-                    info!(name = %name, memory_mib, "start vm command received");
-                    if self.shutting_down {
-                        let _ = response.send(Err(io::Error::new(
-                            io::ErrorKind::NotConnected,
-                            "vm manager is shutting down",
-                        )
-                        .into()));
-                        continue;
-                    }
-                    let config = self.vm_config(name, ssh_key, memory_mib);
-                    let _ = response.send(self.start_vm(config, poll, routes, next_token_count));
-                }
-                VmCommand::List { response } => {
-                    debug!("list vms command received");
-                    let _ = response.send(Ok(self.list_vms()));
-                }
-                VmCommand::Stop { id, response } => {
-                    info!(id, "stop vm command received");
-                    let _ = response.send(self.request_stop_vm(id));
-                }
-                VmCommand::Shutdown { response } => {
-                    info!("shutdown command received");
-                    self.shutting_down = true;
-                    let _ = response.send(self.request_stop_all_vms());
-                }
-            }
+        while !registry_should_exit(&self.registry) {
+            event_manager.run()?;
         }
 
         Ok(())
-    }
-
-    fn should_exit(&self) -> bool {
-        self.shutting_down && self.instances.is_empty()
-    }
-
-    fn request_stop_all_vms(&mut self) -> VmManagerResult<()> {
-        let mut first_error = None;
-
-        for (&id, instance) in &self.instances {
-            if let Err(err) = instance.request_stop() {
-                warn!(vm_id = id, error = %err, "failed to request vm stop during shutdown");
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
-            }
-        }
-
-        if let Some(err) = first_error {
-            Err(err)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn request_stop_vm(&mut self, id: u8) -> VmManagerResult<()> {
-        let instance = self.instances.get(&id).ok_or_else(|| {
-            warn!(id, "stop requested for missing vm");
-            io::Error::new(io::ErrorKind::NotFound, format!("vm {id} is not running"))
-        })?;
-
-        instance.request_stop()
-    }
-
-    fn start_configured_vms(
-        &mut self,
-        poll: &PollContext<u8>,
-        routes: &mut HashMap<u8, EventRoute>,
-        next_token_count: &mut usize,
-    ) -> VmManagerResult<()> {
-        let configs = std::mem::take(&mut self.configs);
-
-        for config in configs.into_values() {
-            self.start_vm(config, poll, routes, next_token_count)?;
-        }
-
-        Ok(())
-    }
-
-    fn next_avail_id(&mut self) -> u8 {
-        let id = self.next_vm_id;
-        self.next_vm_id += 1;
-        id
-    }
-
-    fn vm_config(&mut self, name: String, ssh_key: String, memory_mib: u32) -> VmConfig {
-        VmConfig {
-            id: self.next_avail_id(),
-            name,
-            ssh_key,
-            memory_mib,
-        }
-    }
-
-    fn start_vm(
-        &mut self,
-        config: VmConfig,
-        poll: &PollContext<u8>,
-        routes: &mut HashMap<u8, EventRoute>,
-        next_token_count: &mut usize,
-    ) -> VmManagerResult<VmInfo> {
-        info!(
-            vm_id = config.id(),
-            name = %config.name(),
-            memory_mib = config.memory_mib(),
-            "starting vm"
-        );
-        if self.configs.contains_key(&config.id()) || self.instances.contains_key(&config.id()) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("duplicate vm id {}", config.id()),
-            )
-            .into());
-        }
-
-        let had_instances = !self.instances.is_empty();
-        if !self.shared_host_provisioned {
-            debug!("provisioning shared host");
-            provision::provision_shared_host()?;
-            self.shared_host_provisioned = true;
-            debug!("shared host provisioned");
-        }
-
-        let vm_id = config.id();
-        let instance = match VmInstance::start(config) {
-            Ok(instance) => instance,
-            Err(err) => {
-                error!(vm_id, error = %err, "failed to start vm");
-                cleanup_vm_resources(vm_id);
-                if !had_instances {
-                    self.cleanup_shared_host();
-                }
-                return Err(err);
-            }
-        };
-        self.instances.insert(vm_id, instance);
-
-        let instance = self.instances.get(&vm_id).unwrap();
-        if let Err(err) = instance.register_events(vm_id, poll, routes, next_token_count) {
-            error!(vm_id, error = %err, "failed to register vm events");
-            self.cleanup_instance(vm_id, routes);
-            if !had_instances {
-                self.cleanup_shared_host();
-            }
-            return Err(err);
-        }
-
-        info!(vm_id, "vm started");
-        Ok(instance.info())
-    }
-
-    fn list_vms(&self) -> Vec<VmInfo> {
-        let mut vms = self
-            .instances
-            .values()
-            .map(VmInstance::info)
-            .collect::<Vec<_>>();
-        vms.sort_by_key(|vm| vm.id);
-        vms
-    }
-
-    fn cleanup_instance(&mut self, vm_id: u8, routes: &mut HashMap<u8, EventRoute>) {
-        info!(vm_id, "cleaning up vm");
-        routes.retain(|_, route| route.vm_id != vm_id);
-        if let Some(mut instance) = self.instances.remove(&vm_id) {
-            instance.join_vcpu_thread();
-        }
-        cleanup_vm_resources(vm_id);
-        debug!(vm_id, "vm cleanup completed");
     }
 
     fn cleanup_instances(&mut self) {
-        for (&vm_id, instance) in &self.instances {
-            if let Err(err) = instance.request_stop() {
-                warn!(vm_id, error = %err, "failed to request vm stop during cleanup");
-            }
-        }
-
-        for (vm_id, mut instance) in self.instances.drain() {
-            info!(vm_id, "cleaning up vm");
-            instance.join_vcpu_thread();
-            cleanup_vm_resources(vm_id);
-        }
+        let _ = request_stop_all_registry_vms(&self.registry);
     }
 
     fn cleanup_shared_host(&mut self) {
-        if self.shared_host_provisioned {
-            debug!("cleaning up shared host");
-            if let Err(err) = provision::deprovision_shared_host() {
-                warn!(error = %err, "failed to deprovision shared host");
-            }
-            self.shared_host_provisioned = false;
-        }
+        cleanup_shared_host(&self.registry);
     }
 }
 
@@ -573,6 +486,10 @@ struct VmInstance {
     name: String,
     ip_address: String,
     memory_mib: u32,
+    registry: Arc<Mutex<VmRegistry>>,
+    endpoint: RemoteEndpoint<VmInstance>,
+    subscriber_id: Arc<Mutex<Option<SubscriberId>>>,
+    init_error: Arc<Mutex<Option<Box<dyn std::error::Error + Send + Sync>>>>,
     _vm: VmFd,
     vcpu_stopper: VcpuStopper,
     vcpu_thread: Option<JoinHandle<()>>,
@@ -580,6 +497,7 @@ struct VmInstance {
     blk: BlkDeviceRuntime,
     exit_evt: EventWrapper,
     tap_rx_registered: bool,
+    cleaned_up: bool,
 }
 
 struct NetDeviceRuntime {
@@ -594,7 +512,13 @@ struct BlkDeviceRuntime {
 }
 
 impl VmInstance {
-    fn start(config: VmConfig) -> VmManagerResult<Self> {
+    fn start(
+        config: VmConfig,
+        registry: Arc<Mutex<VmRegistry>>,
+        endpoint: RemoteEndpoint<VmInstance>,
+        subscriber_id: Arc<Mutex<Option<SubscriberId>>>,
+        init_error: Arc<Mutex<Option<Box<dyn std::error::Error + Send + Sync>>>>,
+    ) -> VmManagerResult<Self> {
         let span = tracing::info_span!(
             "vm",
             vm_id = config.id(),
@@ -631,6 +555,10 @@ impl VmInstance {
             name: config.name().to_string(),
             ip_address: config.guest_ip(),
             memory_mib: config.memory_mib(),
+            registry,
+            endpoint,
+            subscriber_id,
+            init_error,
             _vm: vm,
             vcpu_stopper,
             vcpu_thread: Some(vcpu_thread),
@@ -638,6 +566,7 @@ impl VmInstance {
             blk,
             exit_evt,
             tap_rx_registered: false,
+            cleaned_up: false,
         })
     }
 
@@ -766,11 +695,6 @@ impl VmInstance {
         (vcpu_stopper, vcpu_thread, exit_evt)
     }
 
-    fn request_stop(&self) -> VmManagerResult<()> {
-        self.vcpu_stopper.request_stop()?;
-        Ok(())
-    }
-
     fn info(&self) -> VmInfo {
         VmInfo {
             id: self.id,
@@ -789,80 +713,118 @@ impl VmInstance {
         }
     }
 
-    fn register_events(
-        &self,
-        vm_id: u8,
-        poll: &PollContext<u8>,
-        routes: &mut HashMap<u8, EventRoute>,
-        next_token_count: &mut usize,
-    ) -> VmManagerResult<()> {
-        register_event(
-            poll,
-            &self.exit_evt.0,
-            EventRoute {
-                vm_id,
-                kind: EventKind::Exit,
-            },
-            routes,
-            next_token_count,
-        )?;
-        register_event(
-            poll,
-            &self.net.activate_evt,
-            EventRoute {
-                vm_id,
-                kind: EventKind::NetActivate,
-            },
-            routes,
-            next_token_count,
-        )?;
+    fn cleanup(&mut self, ops: &mut EventOps) {
+        if self.cleaned_up {
+            return;
+        }
+
+        info!(vm_id = self.id, "cleaning up vm");
+        self.unregister_events(ops);
+        self.join_vcpu_thread();
+        cleanup_vm_resources(self.id);
+        self.cleaned_up = true;
+        debug!(vm_id = self.id, "vm cleanup completed");
+    }
+
+    fn schedule_remove_subscriber(&self) {
+        let Some(subscriber_id) = *self.subscriber_id.lock().unwrap() else {
+            return;
+        };
+
+        if let Err(err) = self.endpoint.fire(move |ops| {
+            let _ = ops.remove_subscriber(subscriber_id);
+        }) {
+            warn!(vm_id = self.id, error = %err, "failed to schedule vm subscriber removal");
+        }
+    }
+
+    fn unregister_events(&self, ops: &mut EventOps) {
+        let mut events = vec![
+            (self.exit_evt.0.as_raw_fd(), EXIT_EVENT),
+            (self.net.activate_evt.as_raw_fd(), NET_ACTIVATE_EVENT),
+        ];
+
+        if self.tap_rx_registered {
+            events.push((self.net.device.lock().unwrap().tap_raw_fd(), TAP_RX_EVENT));
+        }
+
         for (q_sel, evt) in self.net.queue_events.iter().enumerate() {
-            register_event(
-                poll,
-                evt,
-                EventRoute {
-                    vm_id,
-                    kind: EventKind::NetQueue(q_sel),
-                },
-                routes,
-                next_token_count,
-            )?;
+            events.push((evt.as_raw_fd(), NET_QUEUE_EVENT_BASE + q_sel as u32));
         }
         for (q_sel, evt) in self.blk.queue_events.iter().enumerate() {
-            register_event(
-                poll,
-                evt,
-                EventRoute {
-                    vm_id,
-                    kind: EventKind::BlkQueue(q_sel),
-                },
-                routes,
-                next_token_count,
-            )?;
+            events.push((evt.as_raw_fd(), BLK_QUEUE_EVENT_BASE + q_sel as u32));
+        }
+
+        for (fd, event) in events {
+            if let Err(err) = ops.remove(Events::with_data_raw(fd, event, EventSet::IN)) {
+                warn!(vm_id = self.id, event, error = %err, "failed to unregister vm event");
+            }
+        }
+    }
+
+    fn register_events(&self, ops: &mut EventOps) -> VmManagerResult<()> {
+        ops.add(Events::with_data_raw(
+            self.exit_evt.0.as_raw_fd(),
+            EXIT_EVENT,
+            EventSet::IN,
+        ))?;
+        ops.add(Events::with_data_raw(
+            self.net.activate_evt.as_raw_fd(),
+            NET_ACTIVATE_EVENT,
+            EventSet::IN,
+        ))?;
+
+        for (q_sel, evt) in self.net.queue_events.iter().enumerate() {
+            ops.add(Events::with_data_raw(
+                evt.as_raw_fd(),
+                NET_QUEUE_EVENT_BASE + q_sel as u32,
+                EventSet::IN,
+            ))?;
+        }
+        for (q_sel, evt) in self.blk.queue_events.iter().enumerate() {
+            ops.add(Events::with_data_raw(
+                evt.as_raw_fd(),
+                BLK_QUEUE_EVENT_BASE + q_sel as u32,
+                EventSet::IN,
+            ))?;
         }
 
         Ok(())
     }
 
-    fn handle_event(
-        &mut self,
-        kind: EventKind,
-        vm_id: u8,
-        poll: &PollContext<u8>,
-        routes: &mut HashMap<u8, EventRoute>,
-        next_token_count: &mut usize,
-    ) -> VmManagerResult<bool> {
-        match kind {
-            EventKind::Exit => Ok(self.handle_exit()),
-            EventKind::NetActivate => {
+    fn handle_event(&mut self, event: u32, ops: &mut EventOps) -> VmManagerResult<bool> {
+        if event >= BLK_QUEUE_EVENT_BASE {
+            return Ok(self.handle_blk_queue((event - BLK_QUEUE_EVENT_BASE) as usize));
+        }
+        if event >= NET_QUEUE_EVENT_BASE {
+            return Ok(self.handle_net_queue((event - NET_QUEUE_EVENT_BASE) as usize));
+        }
+
+        match event {
+            EXIT_EVENT => Ok(self.handle_exit()),
+            NET_ACTIVATE_EVENT => {
                 self.handle_net_activate()?;
-                self.register_tap_rx(vm_id, poll, routes, next_token_count)?;
+                self.register_tap_rx(ops)?;
                 Ok(false)
             }
-            EventKind::TapRx => Ok(self.handle_tap_rx()),
-            EventKind::NetQueue(idx) => Ok(self.handle_net_queue(idx)),
-            EventKind::BlkQueue(idx) => Ok(self.handle_blk_queue(idx)),
+            TAP_RX_EVENT => Ok(self.handle_tap_rx()),
+            _ => {
+                warn!(vm_id = self.id, event, "ignoring unknown vm event");
+                Ok(false)
+            }
         }
+    }
+
+    fn register_tap_rx(&mut self, ops: &mut EventOps) -> VmManagerResult<()> {
+        if self.tap_rx_registered {
+            return Ok(());
+        }
+
+        let fd = self.net.device.lock().unwrap().tap_raw_fd();
+        ops.add(Events::with_data_raw(fd, TAP_RX_EVENT, EventSet::IN))?;
+        self.tap_rx_registered = true;
+        debug!(vm_id = self.id, "registered tap rx event");
+        Ok(())
     }
 
     fn handle_exit(&self) -> bool {
@@ -907,35 +869,58 @@ impl VmInstance {
         }
         false
     }
+}
 
-    fn register_tap_rx(
-        &mut self,
-        vm_id: u8,
-        poll: &PollContext<u8>,
-        routes: &mut HashMap<u8, EventRoute>,
-        next_token_count: &mut usize,
-    ) -> VmManagerResult<()> {
-        if self.tap_rx_registered {
-            return Ok(());
+impl Drop for VmInstance {
+    fn drop(&mut self) {
+        if self.cleaned_up {
+            return;
         }
 
-        let token = next_token(next_token_count)?;
-        self.net
-            .device
-            .lock()
-            .unwrap()
-            .register_tap_readable(poll, token)?;
-        routes.insert(
-            token,
-            EventRoute {
-                vm_id,
-                kind: EventKind::TapRx,
-            },
-        );
-        self.tap_rx_registered = true;
-        debug!(vm_id, token, "registered tap rx event");
+        if let Err(err) = self.vcpu_stopper.request_stop() {
+            warn!(vm_id = self.id, error = %err, "failed to request vm stop during drop");
+        }
+        self.join_vcpu_thread();
+        cleanup_vm_resources(self.id);
+        let _ = remove_vm_entry(&self.registry, self.id);
+    }
+}
 
-        Ok(())
+impl MutEventSubscriber for VmInstance {
+    fn init(&mut self, ops: &mut EventOps) {
+        if let Err(err) = self.register_events(ops) {
+            error!(vm_id = self.id, error = %err, "failed to register vm events");
+            *self.init_error.lock().unwrap() = Some(err);
+        }
+    }
+
+    fn process(&mut self, events: Events, ops: &mut EventOps) {
+        if !events.event_set().contains(EventSet::IN) {
+            warn!(
+                vm_id = self.id,
+                event = events.data(),
+                fd = events.fd(),
+                events = ?events.event_set(),
+                "ignoring non-readable vm event"
+            );
+            return;
+        }
+
+        let should_remove = match self.handle_event(events.data(), ops) {
+            Ok(should_remove) => should_remove,
+            Err(err) => {
+                error!(vm_id = self.id, error = %err, "failed to handle vm event");
+                return;
+            }
+        };
+
+        if should_remove {
+            self.cleanup(ops);
+            if remove_vm_entry(&self.registry, self.id) && !has_running_vms(&self.registry) {
+                cleanup_shared_host(&self.registry);
+            }
+            self.schedule_remove_subscriber();
+        }
     }
 }
 
@@ -1115,31 +1100,10 @@ fn lock_host_serial(serial: &Arc<Mutex<HostSerial>>) -> std::sync::MutexGuard<'_
     }
 }
 
-fn register_event(
-    poll: &PollContext<u8>,
-    fd: &impl std::os::fd::AsRawFd,
-    route: EventRoute,
-    routes: &mut HashMap<u8, EventRoute>,
-    next_token_count: &mut usize,
-) -> VmManagerResult<()> {
-    let token = next_token(next_token_count)?;
-    poll.add(fd, token)
-        .map_err(|e| io::Error::from_raw_os_error(e.errno()))?;
-    routes.insert(token, route);
-    Ok(())
-}
-
-fn next_token(next_token_count: &mut usize) -> VmManagerResult<u8> {
-    let token = u8::try_from(*next_token_count)
-        .map_err(|_| io::Error::other("exhausted shared u8 event tokens"))?;
-    *next_token_count += 1;
-    Ok(token)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::HashMap, io::ErrorKind};
+    use std::io::ErrorKind;
 
     fn test_config(id: u8) -> VmConfig {
         VmConfig {
@@ -1160,142 +1124,6 @@ mod tests {
         assert_eq!(config.rootfs_path(), PathBuf::from("/tmp/vm-7/rootfs.ext4"));
         assert_eq!(config.memory_mib(), 512);
         assert_eq!(config.memory_size(), 512 << 20);
-    }
-
-    #[test]
-    fn add_vm_rejects_duplicate_ids() {
-        let mut manager = VmManager::new();
-        let config = test_config(1);
-
-        manager.add_vm(config.clone()).unwrap();
-
-        let err = manager.add_vm(config).unwrap_err();
-        assert_eq!(
-            err.downcast_ref::<io::Error>().unwrap().kind(),
-            ErrorKind::AlreadyExists
-        );
-    }
-
-    #[test]
-    fn request_stop_vm_rejects_missing_instance() {
-        let mut manager = VmManager::new();
-
-        let err = manager.request_stop_vm(1).unwrap_err();
-
-        assert_eq!(
-            err.downcast_ref::<io::Error>().unwrap().kind(),
-            ErrorKind::NotFound
-        );
-    }
-
-    #[test]
-    fn handle_commands_replies_to_stop_for_missing_instance() {
-        let mut manager = VmManager::new();
-        let poll: PollContext<u8> = PollContext::new().unwrap();
-        let mut routes = HashMap::new();
-        let mut next_token_count = 0;
-        let (response_tx, response_rx) = mpsc::channel();
-
-        manager
-            .command_tx
-            .send(VmCommand::Stop {
-                id: 1,
-                response: response_tx,
-            })
-            .unwrap();
-
-        manager
-            .handle_commands(&poll, &mut routes, &mut next_token_count)
-            .unwrap();
-
-        let err = response_rx.recv().unwrap().unwrap_err();
-        assert_eq!(
-            err.downcast_ref::<io::Error>().unwrap().kind(),
-            ErrorKind::NotFound
-        );
-    }
-
-    #[test]
-    fn handle_commands_replies_to_list_with_running_vms() {
-        let mut manager = VmManager::new();
-        let poll: PollContext<u8> = PollContext::new().unwrap();
-        let mut routes = HashMap::new();
-        let mut next_token_count = 0;
-        let (response_tx, response_rx) = mpsc::channel();
-
-        manager
-            .command_tx
-            .send(VmCommand::List {
-                response: response_tx,
-            })
-            .unwrap();
-
-        manager
-            .handle_commands(&poll, &mut routes, &mut next_token_count)
-            .unwrap();
-
-        assert_eq!(response_rx.recv().unwrap().unwrap(), Vec::new());
-    }
-
-    #[test]
-    fn handle_commands_marks_manager_shutting_down() {
-        let mut manager = VmManager::new();
-        let poll: PollContext<u8> = PollContext::new().unwrap();
-        let mut routes = HashMap::new();
-        let mut next_token_count = 0;
-        let (response_tx, response_rx) = mpsc::channel();
-
-        manager
-            .command_tx
-            .send(VmCommand::Shutdown {
-                response: response_tx,
-            })
-            .unwrap();
-
-        manager
-            .handle_commands(&poll, &mut routes, &mut next_token_count)
-            .unwrap();
-
-        response_rx.recv().unwrap().unwrap();
-        assert!(manager.shutting_down);
-        assert!(manager.should_exit());
-    }
-
-    #[test]
-    fn handle_commands_rejects_start_after_shutdown() {
-        let mut manager = VmManager::new();
-        let poll: PollContext<u8> = PollContext::new().unwrap();
-        let mut routes = HashMap::new();
-        let mut next_token_count = 0;
-        let (shutdown_tx, shutdown_rx) = mpsc::channel();
-        let (start_tx, start_rx) = mpsc::channel();
-
-        manager
-            .command_tx
-            .send(VmCommand::Shutdown {
-                response: shutdown_tx,
-            })
-            .unwrap();
-        manager
-            .command_tx
-            .send(VmCommand::Start {
-                name: "test-vm".to_string(),
-                ssh_key: "ssh-ed25519 test".to_string(),
-                memory_mib: 512,
-                response: start_tx,
-            })
-            .unwrap();
-
-        manager
-            .handle_commands(&poll, &mut routes, &mut next_token_count)
-            .unwrap();
-
-        shutdown_rx.recv().unwrap().unwrap();
-        let err = start_rx.recv().unwrap().unwrap_err();
-        assert_eq!(
-            err.downcast_ref::<io::Error>().unwrap().kind(),
-            ErrorKind::NotConnected
-        );
     }
 
     #[test]
@@ -1340,14 +1168,6 @@ mod tests {
     }
 
     #[test]
-    fn next_avail_id_returns_current_id_then_advances() {
-        let mut manager = VmManager::new();
-
-        assert_eq!(manager.next_avail_id(), 0);
-        assert_eq!(manager.next_avail_id(), 1);
-    }
-
-    #[test]
     fn handle_list_vms_rejects_when_manager_is_not_running() {
         let manager = VmManager::new();
         let handle = manager.handle().unwrap();
@@ -1370,102 +1190,16 @@ mod tests {
         assert!(stopper.stop_requested());
     }
 
-    // Token count go up to 255, then no more token.
     #[test]
-    fn next_token_uses_full_u8_range_then_exhausts() {
-        let mut next_token_count = 254;
+    fn allocate_vm_config_returns_current_id_then_advances() {
+        let registry = Arc::new(Mutex::new(VmRegistry::default()));
 
-        assert_eq!(next_token(&mut next_token_count).unwrap(), 254);
-        assert_eq!(next_token(&mut next_token_count).unwrap(), 255);
-        assert_eq!(next_token_count, 256);
+        let first =
+            allocate_vm_config(&registry, "one".to_string(), "ssh test".to_string(), 512).unwrap();
+        let second =
+            allocate_vm_config(&registry, "two".to_string(), "ssh test".to_string(), 512).unwrap();
 
-        let err = next_token(&mut next_token_count).unwrap_err();
-        assert_eq!(
-            err.downcast_ref::<io::Error>().unwrap().kind(),
-            ErrorKind::Other
-        );
-        assert_eq!(next_token_count, 256);
-    }
-
-    // New token go in map with right route.
-    #[test]
-    fn register_event_records_route_under_allocated_token() {
-        let poll: PollContext<u8> = PollContext::new().unwrap();
-        let evt = EventWrapper::new();
-        let mut routes = HashMap::new();
-        let mut next_token_count = 0;
-        let route = EventRoute {
-            vm_id: 9,
-            kind: EventKind::NetQueue(1),
-        };
-
-        register_event(&poll, &evt.0, route, &mut routes, &mut next_token_count).unwrap();
-
-        assert_eq!(next_token_count, 1);
-        assert_eq!(routes.get(&0), Some(&route));
-    }
-
-    // Remove one vm route. Other vm route stay.
-    #[test]
-    fn cleanup_instance_prunes_only_target_vm_routes() {
-        let mut manager = VmManager::new();
-        let mut routes = HashMap::from([
-            (
-                1,
-                EventRoute {
-                    vm_id: 3,
-                    kind: EventKind::Exit,
-                },
-            ),
-            (
-                2,
-                EventRoute {
-                    vm_id: 4,
-                    kind: EventKind::TapRx,
-                },
-            ),
-            (
-                3,
-                EventRoute {
-                    vm_id: 3,
-                    kind: EventKind::NetActivate,
-                },
-            ),
-        ]);
-
-        manager.cleanup_instance(3, &mut routes);
-
-        assert_eq!(routes.len(), 1);
-        assert_eq!(
-            routes.get(&2),
-            Some(&EventRoute {
-                vm_id: 4,
-                kind: EventKind::TapRx,
-            })
-        );
-    }
-
-    // Route point to no vm. Manager do nothing.
-    #[test]
-    fn missing_instance_route_is_ignored() {
-        let mut manager = VmManager::new();
-        let poll: PollContext<u8> = PollContext::new().unwrap();
-        let mut routes = HashMap::new();
-        let mut next_token_count = 0;
-
-        let should_remove = match manager.instances.get_mut(&11) {
-            Some(instance) => instance
-                .handle_event(
-                    EventKind::Exit,
-                    11,
-                    &poll,
-                    &mut routes,
-                    &mut next_token_count,
-                )
-                .unwrap(),
-            None => false,
-        };
-
-        assert!(!should_remove);
+        assert_eq!(first.id(), 0);
+        assert_eq!(second.id(), 1);
     }
 }
