@@ -7,7 +7,7 @@ use std::{
     ptr,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicPtr, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
@@ -1006,33 +1006,37 @@ fn spawn_vcpu_runtime(
 #[derive(Clone)]
 struct VcpuStopper {
     stop_requested: Arc<AtomicBool>,
-    thread: Arc<Mutex<Option<libc::pthread_t>>>,
-    kvm_run: Arc<AtomicPtr<kvm_bindings::kvm_run>>,
+    state: Arc<Mutex<VcpuStopState>>,
+}
+
+#[derive(Default)]
+struct VcpuStopState {
+    thread: Option<libc::pthread_t>,
+    kvm_run_addr: usize,
 }
 
 impl VcpuStopper {
     fn new() -> Self {
         Self {
             stop_requested: Arc::new(AtomicBool::new(false)),
-            thread: Arc::new(Mutex::new(None)),
-            kvm_run: Arc::new(AtomicPtr::new(ptr::null_mut())),
+            state: Arc::new(Mutex::new(VcpuStopState::default())),
         }
     }
 
     fn set_thread(&self) {
         // SAFETY: called from the vCPU thread itself; the pthread id is stored only for best-effort
         // interrupt delivery and cleared before thread exit.
-        *self.thread.lock().unwrap() = Some(unsafe { libc::pthread_self() });
+        self.state.lock().unwrap().thread = Some(unsafe { libc::pthread_self() });
     }
 
     fn clear_thread(&self) {
-        let mut thread = self.thread.lock().unwrap();
-        self.kvm_run.store(ptr::null_mut(), Ordering::SeqCst);
-        *thread = None;
+        let mut state = self.state.lock().unwrap();
+        state.kvm_run_addr = 0;
+        state.thread = None;
     }
 
     fn set_kvm_run(&self, kvm_run: *mut kvm_bindings::kvm_run) {
-        self.kvm_run.store(kvm_run, Ordering::SeqCst);
+        self.state.lock().unwrap().kvm_run_addr = kvm_run as usize;
     }
 
     fn request_stop(&self) -> io::Result<()> {
@@ -1041,17 +1045,18 @@ impl VcpuStopper {
             return Ok(());
         }
 
-        let kvm_run = self.kvm_run.load(Ordering::SeqCst);
-        if !kvm_run.is_null() {
-            // SAFETY: pointer comes from live `VcpuFd::get_kvm_run()` in the vCPU thread and is
-            // cleared before that thread exits. Volatile write is required by KVM immediate_exit.
+        let state = self.state.lock().unwrap();
+        if state.kvm_run_addr != 0 {
+            let kvm_run = state.kvm_run_addr as *mut kvm_bindings::kvm_run;
+            // SAFETY: pointer comes from live `VcpuFd::get_kvm_run()` in the vCPU thread. The same
+            // mutex guards pointer publication and clearing, so it cannot be cleared while this
+            // write is in progress. Volatile write is required by KVM immediate_exit.
             unsafe {
                 ptr::write_volatile(ptr::addr_of_mut!((*kvm_run).immediate_exit), 1);
             }
         }
 
-        let thread = self.thread.lock().unwrap();
-        let Some(thread) = *thread else {
+        let Some(thread) = state.thread else {
             return Ok(());
         };
 

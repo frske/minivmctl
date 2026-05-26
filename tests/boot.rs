@@ -13,6 +13,8 @@ fn guest_memory() -> GuestMemoryMmap<()> {
 }
 
 fn e820_entry(params: &boot_params, idx: usize) -> (u64, u64, u32) {
+    // SAFETY: Linux boot parameter structs are packed, so field reads must be unaligned. Tests pass
+    // valid table indexes from initialized `boot_params` values.
     unsafe {
         let entry: *const linux_loader::bootparam::boot_e820_entry = &params.e820_table[idx];
         (
@@ -24,6 +26,8 @@ fn e820_entry(params: &boot_params, idx: usize) -> (u64, u64, u32) {
 }
 
 fn hdr_field<T: Copy>(field: *const T) -> T {
+    // SAFETY: callers pass pointers to initialized packed header fields; unaligned reads are
+    // required because these fields may not be naturally aligned.
     unsafe { std::ptr::read_unaligned(field) }
 }
 

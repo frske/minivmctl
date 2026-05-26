@@ -218,10 +218,6 @@ pub struct Net<I = Tap> {
     pub activate_event: EventFd,
 }
 
-// SAFETY: `Net` only shares ownership of sendable fields across threads. Guest memory is internally
-// synchronized by `vm-memory`, eventfds are fd-backed, and the TAP implementation is bounded by `I: Send`.
-unsafe impl<I: Send> Send for Net<I> {}
-
 impl<I> Net<I>
 where
     I: NetIo,
