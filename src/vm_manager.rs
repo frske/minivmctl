@@ -494,8 +494,8 @@ struct VmInstance {
     _vm: VmFd,
     vcpu_stopper: VcpuStopper,
     vcpu_thread: Option<JoinHandle<()>>,
-    net: NetDeviceRuntime,
-    blk: BlkDeviceRuntime,
+    net: Option<NetDeviceRuntime>,
+    blk: Option<BlkDeviceRuntime>,
     exit_evt: EventWrapper,
     tap_rx_registered: bool,
     cleaned_up: bool,
@@ -563,8 +563,8 @@ impl VmInstance {
             _vm: vm,
             vcpu_stopper,
             vcpu_thread: Some(vcpu_thread),
-            net,
-            blk,
+            net: Some(net),
+            blk: Some(blk),
             exit_evt,
             tap_rx_registered: false,
             cleaned_up: false,
@@ -722,9 +722,15 @@ impl VmInstance {
         info!(vm_id = self.id, "cleaning up vm");
         self.unregister_events(ops);
         self.join_vcpu_thread();
+        self.drop_devices();
         cleanup_vm_resources(self.id);
         self.cleaned_up = true;
         debug!(vm_id = self.id, "vm cleanup completed");
+    }
+
+    fn drop_devices(&mut self) {
+        self.net.take();
+        self.blk.take();
     }
 
     fn schedule_remove_subscriber(&self) {
@@ -742,17 +748,17 @@ impl VmInstance {
     fn unregister_events(&self, ops: &mut EventOps) {
         let mut events = vec![
             (self.exit_evt.0.as_raw_fd(), EXIT_EVENT),
-            (self.net.activate_evt.as_raw_fd(), NET_ACTIVATE_EVENT),
+            (self.net().activate_evt.as_raw_fd(), NET_ACTIVATE_EVENT),
         ];
 
         if self.tap_rx_registered {
-            events.push((self.net.device.lock().unwrap().tap_raw_fd(), TAP_RX_EVENT));
+            events.push((self.net().device.lock().unwrap().tap_raw_fd(), TAP_RX_EVENT));
         }
 
-        for (q_sel, evt) in self.net.queue_events.iter().enumerate() {
+        for (q_sel, evt) in self.net().queue_events.iter().enumerate() {
             events.push((evt.as_raw_fd(), NET_QUEUE_EVENT_BASE + q_sel as u32));
         }
-        for (q_sel, evt) in self.blk.queue_events.iter().enumerate() {
+        for (q_sel, evt) in self.blk().queue_events.iter().enumerate() {
             events.push((evt.as_raw_fd(), BLK_QUEUE_EVENT_BASE + q_sel as u32));
         }
 
@@ -770,19 +776,19 @@ impl VmInstance {
             EventSet::IN,
         ))?;
         ops.add(Events::with_data_raw(
-            self.net.activate_evt.as_raw_fd(),
+            self.net().activate_evt.as_raw_fd(),
             NET_ACTIVATE_EVENT,
             EventSet::IN,
         ))?;
 
-        for (q_sel, evt) in self.net.queue_events.iter().enumerate() {
+        for (q_sel, evt) in self.net().queue_events.iter().enumerate() {
             ops.add(Events::with_data_raw(
                 evt.as_raw_fd(),
                 NET_QUEUE_EVENT_BASE + q_sel as u32,
                 EventSet::IN,
             ))?;
         }
-        for (q_sel, evt) in self.blk.queue_events.iter().enumerate() {
+        for (q_sel, evt) in self.blk().queue_events.iter().enumerate() {
             ops.add(Events::with_data_raw(
                 evt.as_raw_fd(),
                 BLK_QUEUE_EVENT_BASE + q_sel as u32,
@@ -821,7 +827,7 @@ impl VmInstance {
             return Ok(());
         }
 
-        let fd = self.net.device.lock().unwrap().tap_raw_fd();
+        let fd = self.net().device.lock().unwrap().tap_raw_fd();
         ops.add(Events::with_data_raw(fd, TAP_RX_EVENT, EventSet::IN))?;
         self.tap_rx_registered = true;
         debug!(vm_id = self.id, "registered tap rx event");
@@ -835,6 +841,8 @@ impl VmInstance {
 
     fn handle_net_activate(&mut self) -> io::Result<()> {
         self.net
+            .as_ref()
+            .expect("net runtime present")
             .activate_evt
             .read()
             .map_err(|e| io::Error::other(format!("failed to read activate event: {e}")))?;
@@ -842,7 +850,7 @@ impl VmInstance {
     }
 
     fn handle_tap_rx(&mut self) -> bool {
-        let mut net = self.net.device.lock().unwrap();
+        let mut net = self.net().device.lock().unwrap();
         if let Err(err) = net.process_rx() {
             warn!(vm_id = self.id, error = %err, "failed to process net rx");
         }
@@ -850,10 +858,10 @@ impl VmInstance {
     }
 
     fn handle_net_queue(&mut self, idx: usize) -> bool {
-        if let Err(err) = self.net.queue_events[idx].read() {
+        if let Err(err) = self.net().queue_events[idx].read() {
             warn!(vm_id = self.id, queue = idx, error = %err, "failed to read net queue event");
         }
-        let mut net = self.net.device.lock().unwrap();
+        let mut net = self.net().device.lock().unwrap();
         if let Err(err) = net.process_tx() {
             warn!(vm_id = self.id, queue = idx, error = %err, "failed to process net tx");
         }
@@ -861,14 +869,22 @@ impl VmInstance {
     }
 
     fn handle_blk_queue(&mut self, idx: usize) -> bool {
-        if let Err(err) = self.blk.queue_events[idx].read() {
+        if let Err(err) = self.blk().queue_events[idx].read() {
             warn!(vm_id = self.id, queue = idx, error = %err, "failed to read block queue event");
         }
-        let mut blk = self.blk.device.lock().unwrap();
+        let mut blk = self.blk().device.lock().unwrap();
         if let Err(err) = blk.process_queue() {
             warn!(vm_id = self.id, queue = idx, error = %err, "failed to process block queue");
         }
         false
+    }
+
+    fn net(&self) -> &NetDeviceRuntime {
+        self.net.as_ref().expect("net runtime present")
+    }
+
+    fn blk(&self) -> &BlkDeviceRuntime {
+        self.blk.as_ref().expect("block runtime present")
     }
 }
 
@@ -882,6 +898,7 @@ impl Drop for VmInstance {
             warn!(vm_id = self.id, error = %err, "failed to request vm stop during drop");
         }
         self.join_vcpu_thread();
+        self.drop_devices();
         cleanup_vm_resources(self.id);
         let _ = remove_vm_entry(&self.registry, self.id);
     }
