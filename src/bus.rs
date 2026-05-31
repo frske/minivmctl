@@ -123,32 +123,11 @@ where
     }
 }
 
-pub type PIOBus = Bus<u16, PIODevice>;
 pub type MMIOBus = Bus<u64, MMIODevice>;
-type SerialDevice = ();
-
-#[non_exhaustive]
-pub enum PIODevice {
-    Serial(SerialDevice),
-}
 
 #[non_exhaustive]
 pub enum MMIODevice {
     MMIOTransport(MMIOTransport),
-}
-
-impl PIOBus {
-    pub fn insert_serial(
-        &mut self,
-        address: u16,
-        serial: Arc<Mutex<PIODevice>>,
-    ) -> Result<(), BusError> {
-        const SERIAL_PORT_SIZE: u16 = 0x8;
-        let end = address
-            .checked_add(SERIAL_PORT_SIZE)
-            .ok_or(BusError::AddressOverflow)?;
-        self.insert(address..end, serial)
-    }
 }
 
 impl MMIOBus {
@@ -163,14 +142,6 @@ impl MMIOBus {
             .ok_or(BusError::AddressOverflow)?;
         self.insert(address..end, Arc::new(Mutex::new(device)))
     }
-}
-
-impl DeviceIO for PIODevice {
-    type Offset = u16;
-
-    fn read(&mut self, _offset: Self::Offset, _data: &mut [u8]) {}
-
-    fn write(&mut self, _offset: Self::Offset, _data: &[u8]) {}
 }
 
 impl DeviceIO for MMIODevice {
