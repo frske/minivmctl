@@ -7,6 +7,34 @@ Small implementation of a VMM written in rust using rust-vmm and related compone
 
 `minivmctl` is a Rust microVM control service. It starts and manages KVM-based VMs, exposes a Rocket HTTPS API as control plane
 
+## Quick start
+
+Needs Linux with KVM, `sudo` (TAP/bridge setup and loop mounts), Rust, and the kernel/rootfs build tools (`debootstrap`, `flex`, `bison`, `bc`, `openssl`, `libelf`).
+
+Build an ELF kernel and an ext4 rootfs. The VMM loads the kernel directly, so `-f elf` is required; this takes a while:
+
+```bash
+sudo ./scripts/make_image_6x.sh -f elf -j "$(nproc)" -s 2G -w "$HOME/vmimg"
+```
+
+Then point the VMM at the artifacts by updating `KERNEL_PATH` in `src/vm_manager.rs` and `ROOTFS_PATH` in `src/provision.rs`:
+
+- `$HOME/vmimg/kernel/linux-6.6.99/vmlinux`
+- `$HOME/vmimg/rootfs/rootfs.ext4`
+
+Generate the local TLS certs and start the API and frontend:
+
+```bash
+mkdir -p certs
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout certs/localhost-key.pem -out certs/localhost.pem \
+  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+./scripts/run.sh
+```
+
+`run.sh` builds the backend and serves the API at `https://127.0.0.1:8443` and the frontend at `https://127.0.0.1:5173`.
+
 ## Layout
 
 - `src/main.rs` - launches the API and VM manager
@@ -19,24 +47,6 @@ Small implementation of a VMM written in rust using rust-vmm and related compone
 - `frontend/` - static UI
 - `tests/` - boot, event, and API smoke tests
 - `scripts/` - local dev and image helpers
-
-## Build
-
-```bash
-cargo build
-```
-## Run
-
-The repo includes `scripts/run.sh`, which:
-
-- builds the backend
-- checks for local TLS certs
-- starts the Rocket API on `127.0.0.1:8443`
-- starts the frontend server
-
-```bash
-./scripts/run.sh
-```
 
 ## API
 
