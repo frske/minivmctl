@@ -1,5 +1,8 @@
 Small implementation of a VMM written in rust using rust-vmm and related components
 
+<img width="1444" height="964" alt="high-level-overview" src="https://github.com/user-attachments/assets/ba765b5d-6f93-4f02-9d12-fc2efac77c9c" />
+
+
 # minivmctl
 
 `minivmctl` is a Rust microVM control service. It starts and manages KVM-based VMs, exposes a Rocket HTTPS API as control plane
